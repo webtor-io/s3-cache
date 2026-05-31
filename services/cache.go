@@ -4,7 +4,6 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -107,35 +106,38 @@ func (c *DiskCache) path(key string, alignedOffset int64) (string, error) {
 	return filepath.Join(shard, c.subdir, h[:2], h, chunk), nil
 }
 
-// Get returns (data, nil) on hit, (nil, nil) on clean miss, or (nil, err)
-// on I/O error. Errors are non-fatal — callers should log + fall through
-// to upstream fetch.
-func (c *DiskCache) Get(key string, alignedOffset int64) ([]byte, error) {
+// Get returns an open *os.File handle + size on hit, (nil, 0, nil) on
+// clean miss, or (nil, 0, err) on I/O error. The caller MUST Close the
+// file when done. We deliberately return the handle (not bytes) so the
+// hit-path can stream via io.CopyN instead of materialising a 4 MiB
+// buffer per chunk in RAM — under load that allocation was the
+// dominant heap pressure in pprof.
+func (c *DiskCache) Get(key string, alignedOffset int64) (*os.File, int64, error) {
 	if c == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 	p, err := c.path(key, alignedOffset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	f, err := os.Open(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, err
+		return nil, 0, err
 	}
-	defer f.Close()
-	data, err := io.ReadAll(f)
+	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		f.Close()
+		return nil, 0, err
 	}
 	// LRU touch: bump mtime to "now" on every hit so the evictor's
 	// oldest-mtime-first policy is access-ordered, not creation-ordered.
-	// One extra syscall per hit; cheap compared to the cache read itself.
+	// One extra syscall per hit; cheap compared to the read itself.
 	now := time.Now()
 	_ = os.Chtimes(p, now, now)
-	return data, nil
+	return f, info.Size(), nil
 }
 
 // Put writes data to <path> via tmp+rename. Idempotent — concurrent Puts

@@ -95,7 +95,8 @@ func (r *Readahead) schedule(f *Fetcher, key string, chunkIdx, totalSize int64) 
 		cEnd = totalSize - 1
 	}
 
-	if data, _ := f.cache.Get(key, cStart); data != nil {
+	if file, _, _ := f.cache.Get(key, cStart); file != nil {
+		file.Close()
 		readaheadKicks.WithLabelValues("already_cached").Inc()
 		return
 	}
@@ -132,7 +133,12 @@ func (r *Readahead) schedule(f *Fetcher, key string, chunkIdx, totalSize int64) 
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 		defer cancel()
-		if _, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceReadahead); err != nil {
+		cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceReadahead)
+		// Readahead only cares about populating the cache as a
+		// side effect; the chunkResult itself is discarded. Close
+		// any open file handle (the hit branch) so we don't leak fds.
+		cr.close()
+		if err != nil {
 			log.WithFields(log.Fields{
 				"key": key, "chunk_start": cStart,
 			}).WithError(err).Debug("readahead failed")

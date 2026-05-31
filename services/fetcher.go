@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -171,9 +172,12 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 
 	// Slot semaphore caps how far workers can race ahead of the
 	// consumer. Without it 250 chunks of a 1 GiB file could all
-	// materialize in RAM before the client drains. workers*2 leaves
-	// headroom for workers to always have somewhere to write into.
-	slotCap := workers * 2
+	// materialize in RAM before the client drains. Cap = workers
+	// (one in-flight chunk per worker) — under slow-client load this
+	// halves the transient working set vs the old workers*2 default
+	// without measurably hurting throughput, since workers re-fill
+	// the moment the consumer drains.
+	slotCap := workers
 	if slotCap < 4 {
 		slotCap = 4
 	}
@@ -200,28 +204,35 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 				if totalSize > 0 && cEnd > totalSize-1 {
 					cEnd = totalSize - 1
 				}
-				data, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceForeground)
-				pending[idx] <- chunkResult{data: data, err: err, chunkStart: cStart}
+				cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceForeground)
+				if err != nil {
+					pending[idx] <- chunkResult{err: err, chunkStart: cStart}
+					continue
+				}
+				cr.chunkStart = cStart
+				pending[idx] <- cr
 			}
 		}()
 	}
 
-	// Wait for chunk 0 before committing 206 — earlier failure surfaces
+	// Wait for chunk 0 before committing status — earlier failure surfaces
 	// as a real HTTP error, not a half-written response.
 	var res0 chunkResult
 	select {
 	case res0 = <-pending[0]:
 	case <-ctx.Done():
 		cancel()
-		drainSlots(slots, pending)
+		cleanupPending(slots, pending)
 		wg.Wait()
+		cleanupPending(slots, pending)
 		http.Error(w, "request cancelled", http.StatusBadGateway)
 		return ctx.Err()
 	}
 	if res0.err != nil {
 		cancel()
-		drainSlots(slots, pending)
+		cleanupPending(slots, pending)
 		wg.Wait()
+		cleanupPending(slots, pending)
 		httpErrorFromS3(w, res0.err)
 		return res0.err
 	}
@@ -236,12 +247,15 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	w.WriteHeader(status)
 	flusher, _ := w.(http.Flusher)
 
-	if _, err := writeSliced(w, res0.data, res0.chunkStart, start, end); err != nil {
+	if _, err := res0.writeSlice(w, start, end); err != nil {
+		res0.close()
 		cancel()
-		drainSlots(slots, pending)
+		cleanupPending(slots, pending)
 		wg.Wait()
+		cleanupPending(slots, pending)
 		return err
 	}
+	res0.close()
 	<-slots
 	if flusher != nil {
 		flusher.Flush()
@@ -255,24 +269,29 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 					"key": key, "chunk": i,
 				}).WithError(res.err).Warn("chunk failed mid-response")
 				cancel()
-				drainSlots(slots, pending)
+				cleanupPending(slots, pending)
 				wg.Wait()
+				cleanupPending(slots, pending)
 				return res.err
 			}
-			if _, err := writeSliced(w, res.data, res.chunkStart, start, end); err != nil {
+			if _, err := res.writeSlice(w, start, end); err != nil {
+				res.close()
 				cancel()
-				drainSlots(slots, pending)
+				cleanupPending(slots, pending)
 				wg.Wait()
+				cleanupPending(slots, pending)
 				return err
 			}
+			res.close()
 			<-slots
 			if flusher != nil {
 				flusher.Flush()
 			}
 		case <-ctx.Done():
 			cancel()
-			drainSlots(slots, pending)
+			cleanupPending(slots, pending)
 			wg.Wait()
+			cleanupPending(slots, pending)
 			return ctx.Err()
 		}
 	}
@@ -286,29 +305,69 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	return nil
 }
 
-// writeSliced writes the portion of `chunk` (whose bytes start at
-// chunkStart) that falls inside [reqStart..reqEnd]. Used to trim the
-// first/last chunks down to the requested span.
-func writeSliced(w io.Writer, chunk []byte, chunkStart, reqStart, reqEnd int64) (int, error) {
-	chunkEnd := chunkStart + int64(len(chunk)) - 1
+// chunkResult is the worker→consumer payload. Exactly one of {data, file}
+// is set on success: a cache hit returns the open *os.File so the
+// consumer can stream slices via io.CopyN (no 4 MiB heap alloc per
+// hit); a cache miss returns the freshly-fetched bytes (which already
+// got cached to disk by fetchUncached).
+//
+// The consumer MUST call close() on every chunkResult it reads, even
+// (especially) on error paths — otherwise the file handle leaks.
+type chunkResult struct {
+	data       []byte
+	file       *os.File
+	fileSize   int64
+	err        error
+	chunkStart int64
+}
+
+func (cr *chunkResult) size() int64 {
+	if cr.file != nil {
+		return cr.fileSize
+	}
+	return int64(len(cr.data))
+}
+
+func (cr *chunkResult) close() {
+	if cr.file != nil {
+		_ = cr.file.Close()
+		cr.file = nil
+	}
+}
+
+// writeSlice writes the portion of the chunk that falls inside
+// [reqStart..reqEnd]. From the hit path it Seeks + io.CopyN'es out
+// of the open file; from the miss path it w.Write's the in-memory
+// slice.
+func (cr *chunkResult) writeSlice(w io.Writer, reqStart, reqEnd int64) (int64, error) {
+	chunkStart := cr.chunkStart
+	chunkEnd := chunkStart + cr.size() - 1
 	sliceStart := int64(0)
 	if reqStart > chunkStart {
 		sliceStart = reqStart - chunkStart
 	}
-	sliceEnd := int64(len(chunk))
+	sliceEnd := cr.size()
 	if reqEnd < chunkEnd {
 		sliceEnd = reqEnd - chunkStart + 1
 	}
 	if sliceStart >= sliceEnd {
 		return 0, nil
 	}
-	return w.Write(chunk[sliceStart:sliceEnd])
+	if cr.file != nil {
+		if _, err := cr.file.Seek(sliceStart, io.SeekStart); err != nil {
+			return 0, err
+		}
+		return io.CopyN(w, cr.file, sliceEnd-sliceStart)
+	}
+	n, err := w.Write(cr.data[sliceStart:sliceEnd])
+	return int64(n), err
 }
 
-// drainSlots non-blockingly empties both the slot semaphore and any
-// already-produced chunk results so workers can finish their send + exit
-// without leaking.
-func drainSlots(slots chan struct{}, pending []chan chunkResult) {
+// cleanupPending drains the slot semaphore (so blocked workers can
+// proceed and exit) and closes any chunkResult left in the per-chunk
+// channels — necessary because hit results carry an open *os.File.
+// Safe to call multiple times.
+func cleanupPending(slots chan struct{}, pending []chan chunkResult) {
 	for {
 		select {
 		case <-slots:
@@ -319,35 +378,32 @@ func drainSlots(slots chan struct{}, pending []chan chunkResult) {
 pendingDrain:
 	for i := range pending {
 		select {
-		case <-pending[i]:
+		case cr := <-pending[i]:
+			cr.close()
 		default:
 		}
 	}
 }
 
-type chunkResult struct {
-	data       []byte
-	err        error
-	chunkStart int64
-}
-
 // fetchChunk pulls a single aligned chunk: cache lookup → singleflight →
 // upstream + cache write. `source` labels metrics for foreground vs
-// readahead traffic.
+// readahead traffic. On a hit, the returned chunkResult carries an open
+// *os.File; on a miss, it carries the freshly-fetched bytes. Callers
+// MUST chunkResult.close() in either case.
 //
 // start MUST be chunkSize-aligned; end is start+chunkSize-1 unless this
 // is the last chunk in the object (EOF-clamped). The cache key is keyed
 // on start only — the same aligned offset always means the same chunk.
-func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, source string) ([]byte, error) {
-	if data, err := f.cache.Get(key, start); err != nil {
+func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, source string) (chunkResult, error) {
+	if file, size, err := f.cache.Get(key, start); err != nil {
 		cacheLookups.WithLabelValues("error").Inc()
 		log.WithError(err).WithFields(log.Fields{
 			"key": key, "chunk_start": start,
 		}).Warn("cache get failed")
-	} else if data != nil {
+	} else if file != nil {
 		cacheLookups.WithLabelValues("hit").Inc()
-		cacheBytesServed.Add(float64(len(data)))
-		return data, nil
+		cacheBytesServed.Add(float64(size))
+		return chunkResult{file: file, fileSize: size, chunkStart: start}, nil
 	} else {
 		cacheLookups.WithLabelValues("miss").Inc()
 	}
@@ -359,7 +415,10 @@ func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, 
 	if shared {
 		singleflightShared.Inc()
 	}
-	return data, err
+	if err != nil {
+		return chunkResult{}, err
+	}
+	return chunkResult{data: data, chunkStart: start}, nil
 }
 
 // fetchUncached pulls bytes from S3 and writes them to cache. Cache
