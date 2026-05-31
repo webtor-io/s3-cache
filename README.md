@@ -34,20 +34,28 @@ client → vault (302 with stable URL) → s3-cache → object storage
                                                │    hit → serve from /webtor/s3-cache*
                                                │    miss → singleflight → upstream
                                                ├─ N=8 workers per request (own TCP each)
-                                               ├─ wait for chunk 0 → 206
+                                               ├─ wait for chunk 0 → 200/206
                                                ├─ stream chunks 1..N in order
                                                └─ kick readahead (K aligned chunks)
 ```
 
-Calling convention: `GET /{key}` with `Range: bytes=start-end`. HEAD
-returns metadata. The bucket is fixed per-deploy via `AWS_BUCKET` —
-single-tenant, so URLs don't carry it.
+Calling convention: `GET /{key}`. HEAD returns metadata. Add
+`Range: bytes=start-end` for partial fetch. The bucket is fixed
+per-deploy via `AWS_BUCKET` — single-tenant, so URLs don't carry it.
 
 Every request goes through the **same aligned-chunk path**, including
 sub-chunk-sized HLS-segment reads — the cache keys on *absolute* aligned
 offsets, so request-relative offsets would defeat reuse across requests.
 For a < 4 MiB request this still amounts to one upstream GET that gets
 sliced down to the requested span.
+
+**Status semantics (RFC 7233):** A `Range` request gets `206 Partial
+Content` + `Content-Range`. A plain GET gets `200 OK` + `Content-Length`,
+no `Content-Range` header. Mismatching this — returning 206 on a request
+that didn't ask for a range — broke prod: thp's `redirectFollowingTransport`
+proxies our status back to the original client and returned 403 on the
+unexpected 206. Don't refactor the chunked fetch path to short-circuit
+this status-code branching.
 
 The status code is **only committed after chunk 0 lands**, so any upstream
 failure on the first chunk yields a clean `502 Bad Gateway` instead of a

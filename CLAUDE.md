@@ -84,7 +84,7 @@ GET /{key}  Range: bytes=start-end
      workers call fetchChunk(absChunkIdx * chunkSize, ...)
      wait for pending[0]:
         err → cancel + httpErrorFromS3 → return err (502)
-        ok  → write 206 + headers + sliced chunk 0 bytes
+        ok  → write {200 if no Range else 206} + headers + sliced chunk 0 bytes
      for i in 1..N-1:
         select pending[i] | ctx.Done
         err → log warn, cancel, return (connection closed)
@@ -110,9 +110,16 @@ GET /{key}  Range: bytes=start-end
   would only cache-hit on bit-exact replays. The cost is materialising
   one full chunk even for a sub-chunk-sized request, which is ~negligible
   compared to dialing upstream.
+- **Status code mirrors RFC 7233** — Range request → 206 + Content-Range,
+  plain GET → 200 + Content-Length (no Content-Range). Threading
+  `rangeRequested` from `web.go` into `serveAligned` isn't cosmetic:
+  thp's `redirectFollowingTransport` returns **403 to the client** if it
+  sees a 206 on a non-Range request. Production incident 2026-05-31 —
+  see `feedback_206_only_for_range_requests.md` in memory.
 - **Status not committed until chunk 0 ready** — pre-header failures yield
-  a clean `502 Bad Gateway`. Once we write 206 we're locked into a
-  Content-Length, so failures on chunks 1..N can only abort the connection.
+  a clean `502 Bad Gateway`. Once we write the status (200 or 206) we're
+  locked into a Content-Length, so failures on chunks 1..N can only
+  abort the connection.
 - **HTTP/1.1 forced** (`ForceAttemptHTTP2: false` + `TLSNextProto:
   map[]{}`) — under HTTP/2 all parallel chunk streams would share one TCP
   socket, so a slowdown would stall every worker at once and
