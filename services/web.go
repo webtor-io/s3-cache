@@ -133,7 +133,10 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 		if err := s.fetcher.Head(ctx, w, bucket, key); err != nil {
 			logger.WithError(err).Warn("HEAD failed")
 			httpErrorFromS3(w, err)
+			requestsTotal.WithLabelValues("HEAD", "error").Inc()
+			return
 		}
+		requestsTotal.WithLabelValues("HEAD", "ok").Inc()
 		return
 	}
 
@@ -141,9 +144,11 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 	if err := s.fetcher.Get(ctx, w, bucket, key, start, end); err != nil {
 		// If we've already written some bytes, just log; cannot reset response.
 		logger.WithError(err).WithField("elapsed", time.Since(t0)).Warn("GET failed")
+		requestsTotal.WithLabelValues("GET", "error").Inc()
 		return
 	}
 	logger.WithField("elapsed", time.Since(t0)).Debug("GET served")
+	requestsTotal.WithLabelValues("GET", "ok").Inc()
 }
 
 func httpErrorFromS3(w http.ResponseWriter, err error) {

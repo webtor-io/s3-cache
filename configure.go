@@ -15,9 +15,14 @@ import (
 func configure(app *cli.App) {
 	app.Flags = []cli.Flag{}
 	app.Flags = cs.RegisterProbeFlags(app.Flags)
+	app.Flags = cs.RegisterPromFlags(app.Flags)
+	app.Flags = cs.RegisterPprofFlags(app.Flags)
 	app.Flags = cs.RegisterS3ClientFlags(app.Flags)
 	app.Flags = s.RegisterWebFlags(app.Flags)
 	app.Flags = s.RegisterFetcherFlags(app.Flags)
+	app.Flags = s.RegisterCacheFlags(app.Flags)
+	app.Flags = s.RegisterReadaheadFlags(app.Flags)
+	app.Flags = s.RegisterEvictionFlags(app.Flags)
 	app.Action = run
 }
 
@@ -28,6 +33,18 @@ func run(c *cli.Context) error {
 	if probe != nil {
 		servers = append(servers, probe)
 		defer probe.Close()
+	}
+
+	prom := cs.NewProm(c)
+	if prom != nil {
+		servers = append(servers, prom)
+		defer prom.Close()
+	}
+
+	pprof := cs.NewPprof(c)
+	if pprof != nil {
+		servers = append(servers, pprof)
+		defer pprof.Close()
 	}
 
 	httpCl := &http.Client{
@@ -43,9 +60,7 @@ func run(c *cli.Context) error {
 			// odds against any per-connection rate variance.
 			ForceAttemptHTTP2: false,
 			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
-			// Bound TTFB: if S3 doesn't return response headers in 3s, fail fast
-			// and let the chunk retry path kick in. Body reads are unaffected
-			// (slow-detector handles those).
+			// Bound TTFB: if S3 doesn't return response headers in 3s, fail fast.
 			ResponseHeaderTimeout: 3 * time.Second,
 			// Bound TCP+TLS handshake similarly.
 			DialContext: (&net.Dialer{
@@ -61,7 +76,15 @@ func run(c *cli.Context) error {
 		log.Fatal("S3 client not configured — set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_ENDPOINT/AWS_REGION")
 	}
 
-	fetcher := s.NewFetcher(c, s3cl)
+	cache := s.NewDiskCache(c)
+	readahead := s.NewReadahead(c)
+	fetcher := s.NewFetcher(c, s3cl, cache, readahead)
+
+	if evictor := s.NewEvictor(c, cache); evictor != nil {
+		servers = append(servers, evictor)
+		defer evictor.Close()
+	}
+
 	web := s.NewWeb(c, fetcher)
 	defer web.Close()
 	servers = append(servers, web)
