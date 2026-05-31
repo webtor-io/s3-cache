@@ -72,9 +72,11 @@ same node hit the same shaper. The cache is what decouples us.
   way s3-cache automatically follows whatever multi-disk layout the
   node admin gave TWS, and eviction stays scoped to our subdir so
   torrent data sitting next to us under `data1/` is never touched.
-- **Chunk file** at `/webtor/dataN/s3-cache/<sha1[:2]>/<sha1>/chunk_<offset:020d>.bin`
-  where `sha1 = sha1(key)` (bucket is fixed per deploy). Atomic writes
-  via tmp file + rename — never serves a torn chunk.
+- **Chunk file** at `/webtor/dataN/s3-cache/<keyHash[:2]>/<keyHash>/<chunkHash>`
+  where `keyHash = sha1(key)` (bucket fixed per deploy) and
+  `chunkHash = sha1(key + ":" + offset)`. Uniform 40-char hex names,
+  no prefix/suffix — matches TWS's naming style. Atomic writes via
+  tmp file + rename — never serves a torn chunk.
 - **LRU eviction**, **per-shard** size cap. `os.Chtimes` bumps mtime on
   every cache hit, and the evictor sweeps oldest-mtime files until each
   shard is below ~90% of the cap. Per-shard (not global) so one hot key

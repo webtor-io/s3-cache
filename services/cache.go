@@ -98,7 +98,13 @@ func (c *DiskCache) path(key string, alignedOffset int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(shard, c.subdir, h[:2], h, fmt.Sprintf("chunk_%020d.bin", alignedOffset)), nil
+	// Chunk filename = sha1(key + ":" + offset). Uniform 40-char hex,
+	// no prefix/suffix — matches TWS's naming style. Offset is no
+	// longer human-readable from the filename; that's fine since the
+	// only callers are this process and the evictor (by mtime).
+	chunkSum := sha1.Sum([]byte(key + ":" + strconv.FormatInt(alignedOffset, 10)))
+	chunk := hex.EncodeToString(chunkSum[:])
+	return filepath.Join(shard, c.subdir, h[:2], h, chunk), nil
 }
 
 // Get returns (data, nil) on hit, (nil, nil) on clean miss, or (nil, err)
