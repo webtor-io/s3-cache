@@ -91,9 +91,8 @@ func (c *DiskCache) CacheRoots() ([]string, error) {
 	return out, nil
 }
 
-func (c *DiskCache) path(bucket, key string, alignedOffset int64) (string, error) {
-	id := bucket + "/" + key
-	sum := sha1.Sum([]byte(id))
+func (c *DiskCache) path(key string, alignedOffset int64) (string, error) {
+	sum := sha1.Sum([]byte(key))
 	h := hex.EncodeToString(sum[:])
 	shard, err := getDir(c.location, h)
 	if err != nil {
@@ -105,11 +104,11 @@ func (c *DiskCache) path(bucket, key string, alignedOffset int64) (string, error
 // Get returns (data, nil) on hit, (nil, nil) on clean miss, or (nil, err)
 // on I/O error. Errors are non-fatal — callers should log + fall through
 // to upstream fetch.
-func (c *DiskCache) Get(bucket, key string, alignedOffset int64) ([]byte, error) {
+func (c *DiskCache) Get(key string, alignedOffset int64) ([]byte, error) {
 	if c == nil {
 		return nil, nil
 	}
-	p, err := c.path(bucket, key, alignedOffset)
+	p, err := c.path(key, alignedOffset)
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +134,11 @@ func (c *DiskCache) Get(bucket, key string, alignedOffset int64) ([]byte, error)
 
 // Put writes data to <path> via tmp+rename. Idempotent — concurrent Puts
 // for the same key race on the rename and the loser silently overwrites.
-func (c *DiskCache) Put(bucket, key string, alignedOffset int64, data []byte) error {
+func (c *DiskCache) Put(key string, alignedOffset int64, data []byte) error {
 	if c == nil {
 		return nil
 	}
-	p, err := c.path(bucket, key, alignedOffset)
+	p, err := c.path(key, alignedOffset)
 	if err != nil {
 		return err
 	}

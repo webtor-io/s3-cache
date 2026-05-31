@@ -39,8 +39,9 @@ client → vault (302 with stable URL) → s3-cache → object storage
                                                └─ kick readahead (K aligned chunks)
 ```
 
-Calling convention is S3-compatible: `GET /{bucket}/{key}` with
-`Range: bytes=start-end`. HEAD returns metadata.
+Calling convention: `GET /{key}` with `Range: bytes=start-end`. HEAD
+returns metadata. The bucket is fixed per-deploy via `AWS_BUCKET` —
+single-tenant, so URLs don't carry it.
 
 Every request goes through the **same aligned-chunk path**, including
 sub-chunk-sized HLS-segment reads — the cache keys on *absolute* aligned
@@ -72,8 +73,8 @@ same node hit the same shaper. The cache is what decouples us.
   node admin gave TWS, and eviction stays scoped to our subdir so
   torrent data sitting next to us under `data1/` is never touched.
 - **Chunk file** at `/webtor/dataN/s3-cache/<sha1[:2]>/<sha1>/chunk_<offset:020d>.bin`
-  where `sha1 = sha1(bucket+"/"+key)`. Atomic writes via tmp file +
-  rename — never serves a torn chunk.
+  where `sha1 = sha1(key)` (bucket is fixed per deploy). Atomic writes
+  via tmp file + rename — never serves a torn chunk.
 - **LRU eviction**, **per-shard** size cap. `os.Chtimes` bumps mtime on
   every cache hit, and the evictor sweeps oldest-mtime files until each
   shard is below ~90% of the cap. Per-shard (not global) so one hot key
@@ -85,9 +86,9 @@ same node hit the same shaper. The cache is what decouples us.
   chunks past the tail. Best-effort: drops kicks when the readahead
   worker pool is saturated, never blocks foreground.
 
-Cache content is assumed immutable per `(bucket, key)` (typical for
-webtor storage). There is no ETag invalidation — bust the cache by
-deleting the shard files or by changing the key.
+Cache content is assumed immutable per key (typical for webtor storage).
+There is no ETag invalidation — bust the cache by deleting the shard
+files or by changing the key.
 
 ## Build & run
 
@@ -103,12 +104,13 @@ AWS_ACCESS_KEY_ID=... \
 AWS_SECRET_ACCESS_KEY=... \
 AWS_ENDPOINT=https://... \
 AWS_REGION=... \
+AWS_BUCKET=webtor-vault \
 CACHE_ENABLED=true \
 CACHE_DIR=/tmp/s3-cache/* \
 ./server
 
-curl -I http://localhost:8080/<bucket>/<key>
-curl -r 0-52428800 http://localhost:8080/<bucket>/<key> -o /dev/null
+curl -I http://localhost:8080/<key>
+curl -r 0-52428800 http://localhost:8080/<key> -o /dev/null
 ```
 
 ## Configuration
@@ -126,6 +128,7 @@ All settings via env vars (or matching CLI flags).
 | `AWS_ENDPOINT` | — | S3-compatible endpoint |
 | `AWS_REGION` | — | S3 region |
 | `AWS_NO_SSL` | `false` | Disable TLS to upstream |
+| `AWS_BUCKET` | — | S3 bucket (required; single-tenant — same bucket for every request) |
 | `CHUNK_SIZE` | 4194304 (4 MiB) | Chunk granularity (also cache granularity) |
 | `WORKERS` | 8 | Concurrent S3 fetches per request |
 | `CACHE_ENABLED` | `false` | Enable on-disk chunk cache |
@@ -169,6 +172,6 @@ the host (same convention as TWS / content-transcoder).
 ## Integration with vault
 
 When `S3_CACHE_URL` is set in vault, its `/webseed/{id}/{path}` handler
-redirects clients to `${S3_CACHE_URL}/{bucket}/{key}` instead of generating
+redirects clients to `${S3_CACHE_URL}/{key}` instead of generating
 a presigned upstream URL. Empty env disables — falls back to direct
 presigned upstream, so rollback is a single env unset.

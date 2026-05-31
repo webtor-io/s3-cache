@@ -21,6 +21,7 @@ import (
 const (
 	ChunkSizeFlag = "chunk-size"
 	WorkersFlag   = "workers"
+	BucketFlag    = "aws-bucket"
 )
 
 const (
@@ -42,11 +43,17 @@ func RegisterFetcherFlags(f []cli.Flag) []cli.Flag {
 			Value:  8,
 			EnvVar: "WORKERS",
 		},
+		cli.StringFlag{
+			Name:   BucketFlag,
+			Usage:  "S3 bucket to serve from (single-tenant: bucket is fixed by config, not in URL)",
+			EnvVar: "AWS_BUCKET",
+		},
 	)
 }
 
 type Fetcher struct {
 	s3cl      *cs.S3Client
+	bucket    string
 	chunkSize int64
 	workers   int
 	cache     *DiskCache
@@ -55,8 +62,13 @@ type Fetcher struct {
 }
 
 func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *Readahead) *Fetcher {
+	bucket := c.String(BucketFlag)
+	if bucket == "" {
+		log.Fatal("AWS_BUCKET is required")
+	}
 	return &Fetcher{
 		s3cl:      s3cl,
+		bucket:    bucket,
 		chunkSize: c.Int64(ChunkSizeFlag),
 		workers:   c.Int(WorkersFlag),
 		cache:     cache,
@@ -66,9 +78,9 @@ func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *
 }
 
 // Head issues HeadObject and copies Content-Length / Content-Type / ETag to w.
-func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, bucket, key string) error {
+func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, key string) error {
 	out, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
+		Bucket: aws.String(f.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
@@ -96,11 +108,11 @@ func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, bucket, key s
 // so request-relative offsets would defeat reuse across requests. For
 // sub-chunk-sized requests this still amounts to one upstream GET (one
 // chunk fetched, sliced to the requested span).
-func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, bucket, key string, start, end int64) error {
+func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, start, end int64) error {
 	totalSize := int64(-1)
 	if end < 0 {
 		hd, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(bucket),
+			Bucket: aws.String(f.bucket),
 			Key:    aws.String(key),
 		})
 		if err != nil {
@@ -124,7 +136,7 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, bucket, key st
 		return errors.New("empty range")
 	}
 
-	return f.serveAligned(ctx, w, bucket, key, start, end, totalSize)
+	return f.serveAligned(ctx, w, key, start, end, totalSize)
 }
 
 // serveAligned splits [start..end] into chunkSize-aligned chunks
@@ -135,7 +147,7 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, bucket, key st
 // Status commit is deferred until chunk 0 resolves: a pre-header
 // upstream failure yields a clean 502; failures on later chunks can
 // only abort an already-streaming response.
-func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, bucket, key string, start, end, totalSize int64) error {
+func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key string, start, end, totalSize int64) error {
 	chunkSize := f.chunkSize
 	firstChunkIdx := start / chunkSize
 	lastChunkIdx := end / chunkSize
@@ -188,7 +200,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, bucke
 				if totalSize > 0 && cEnd > totalSize-1 {
 					cEnd = totalSize - 1
 				}
-				data, err := f.fetchChunk(ctx, bucket, key, cStart, cEnd, sourceForeground)
+				data, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceForeground)
 				pending[idx] <- chunkResult{data: data, err: err, chunkStart: cStart}
 			}
 		}()
@@ -235,7 +247,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, bucke
 		case res := <-pending[i]:
 			if res.err != nil {
 				log.WithFields(log.Fields{
-					"bucket": bucket, "key": key, "chunk": i,
+					"key": key, "chunk": i,
 				}).WithError(res.err).Warn("chunk failed mid-response")
 				cancel()
 				drainSlots(slots, pending)
@@ -264,7 +276,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, bucke
 	// Sequential readahead kicks past the served tail. Fire-and-forget;
 	// schedule() handles dedup / saturation / cache-already-hit.
 	if f.readahead != nil {
-		f.readahead.Kick(f, bucket, key, lastChunkIdx+1, totalSize)
+		f.readahead.Kick(f, key, lastChunkIdx+1, totalSize)
 	}
 	return nil
 }
@@ -321,11 +333,11 @@ type chunkResult struct {
 // start MUST be chunkSize-aligned; end is start+chunkSize-1 unless this
 // is the last chunk in the object (EOF-clamped). The cache key is keyed
 // on start only — the same aligned offset always means the same chunk.
-func (f *Fetcher) fetchChunk(ctx context.Context, bucket, key string, start, end int64, source string) ([]byte, error) {
-	if data, err := f.cache.Get(bucket, key, start); err != nil {
+func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, source string) ([]byte, error) {
+	if data, err := f.cache.Get(key, start); err != nil {
 		cacheLookups.WithLabelValues("error").Inc()
 		log.WithError(err).WithFields(log.Fields{
-			"bucket": bucket, "key": key, "chunk_start": start,
+			"key": key, "chunk_start": start,
 		}).Warn("cache get failed")
 	} else if data != nil {
 		cacheLookups.WithLabelValues("hit").Inc()
@@ -335,9 +347,9 @@ func (f *Fetcher) fetchChunk(ctx context.Context, bucket, key string, start, end
 		cacheLookups.WithLabelValues("miss").Inc()
 	}
 
-	sfKey := fmt.Sprintf("%s/%s/%d", bucket, key, start)
+	sfKey := fmt.Sprintf("%s/%d", key, start)
 	data, err, shared := f.sf.Do(sfKey, func() ([]byte, error) {
-		return f.fetchUncached(ctx, bucket, key, start, end, source)
+		return f.fetchUncached(ctx, key, start, end, source)
 	})
 	if shared {
 		singleflightShared.Inc()
@@ -348,9 +360,9 @@ func (f *Fetcher) fetchChunk(ctx context.Context, bucket, key string, start, end
 // fetchUncached pulls bytes from S3 and writes them to cache. Cache
 // failures are logged but don't fail the request — a degraded cache is
 // still better than no response.
-func (f *Fetcher) fetchUncached(ctx context.Context, bucket, key string, start, end int64, source string) ([]byte, error) {
+func (f *Fetcher) fetchUncached(ctx context.Context, key string, start, end int64, source string) ([]byte, error) {
 	t0 := time.Now()
-	body, _, _, err := f.openRange(ctx, bucket, key, start, end)
+	body, _, _, err := f.openRange(ctx, key, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -368,10 +380,10 @@ func (f *Fetcher) fetchUncached(ctx context.Context, bucket, key string, start, 
 	upstreamChunkDuration.WithLabelValues(source).Observe(time.Since(t0).Seconds())
 	upstreamBytesFetched.Add(float64(n))
 
-	if err := f.cache.Put(bucket, key, start, data); err != nil {
+	if err := f.cache.Put(key, start, data); err != nil {
 		cacheWrites.WithLabelValues("error").Inc()
 		log.WithError(err).WithFields(log.Fields{
-			"bucket": bucket, "key": key, "chunk_start": start,
+			"key": key, "chunk_start": start,
 		}).Warn("cache put failed")
 	} else if f.cache != nil {
 		cacheWrites.WithLabelValues("ok").Inc()
@@ -381,9 +393,9 @@ func (f *Fetcher) fetchUncached(ctx context.Context, bucket, key string, start, 
 
 // openRange opens a single Range GET against S3. Returns body +
 // Content-Range + Content-Type.
-func (f *Fetcher) openRange(ctx context.Context, bucket, key string, start, end int64) (io.ReadCloser, string, string, error) {
+func (f *Fetcher) openRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, string, string, error) {
 	in := &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
+		Bucket: aws.String(f.bucket),
 		Key:    aws.String(key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
 	}

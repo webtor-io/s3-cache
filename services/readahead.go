@@ -72,7 +72,7 @@ func NewReadahead(c *cli.Context) *Readahead {
 // Kick schedules readahead for `chunks` aligned chunks starting at
 // fromChunkIdx. totalSize must be known (>0); without it we don't know
 // where the file ends.
-func (r *Readahead) Kick(f *Fetcher, bucket, key string, fromChunkIdx, totalSize int64) {
+func (r *Readahead) Kick(f *Fetcher, key string, fromChunkIdx, totalSize int64) {
 	if r == nil || r.chunks == 0 || totalSize <= 0 {
 		return
 	}
@@ -83,11 +83,11 @@ func (r *Readahead) Kick(f *Fetcher, bucket, key string, fromChunkIdx, totalSize
 		if c > lastChunkIdx {
 			return
 		}
-		r.schedule(f, bucket, key, c, totalSize)
+		r.schedule(f, key, c, totalSize)
 	}
 }
 
-func (r *Readahead) schedule(f *Fetcher, bucket, key string, chunkIdx, totalSize int64) {
+func (r *Readahead) schedule(f *Fetcher, key string, chunkIdx, totalSize int64) {
 	chunkSize := f.chunkSize
 	cStart := chunkIdx * chunkSize
 	cEnd := cStart + chunkSize - 1
@@ -95,12 +95,12 @@ func (r *Readahead) schedule(f *Fetcher, bucket, key string, chunkIdx, totalSize
 		cEnd = totalSize - 1
 	}
 
-	if data, _ := f.cache.Get(bucket, key, cStart); data != nil {
+	if data, _ := f.cache.Get(key, cStart); data != nil {
 		readaheadKicks.WithLabelValues("already_cached").Inc()
 		return
 	}
 
-	dedupKey := bucket + "/" + key + "/" + itoa(cStart)
+	dedupKey := key + "/" + itoa(cStart)
 	r.mu.Lock()
 	if _, ok := r.inflight[dedupKey]; ok {
 		r.mu.Unlock()
@@ -132,9 +132,9 @@ func (r *Readahead) schedule(f *Fetcher, bucket, key string, chunkIdx, totalSize
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 		defer cancel()
-		if _, err := f.fetchChunk(ctx, bucket, key, cStart, cEnd, sourceReadahead); err != nil {
+		if _, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceReadahead); err != nil {
 			log.WithFields(log.Fields{
-				"bucket": bucket, "key": key, "chunk_start": cStart,
+				"key": key, "chunk_start": cStart,
 			}).WithError(err).Debug("readahead failed")
 		}
 	}()

@@ -89,14 +89,16 @@ func parseRange(h string) (start, end int64, err error) {
 	return start, end, nil
 }
 
-// parsePath splits "/bucket/key/with/slashes" into ("bucket", "key/with/slashes").
-func parsePath(p string) (bucket, key string, ok bool) {
+// parseKey returns the S3 object key from the URL path. The bucket is
+// fixed per-deploy via AWS_BUCKET, so the URL carries only the key.
+// We accept the entire path after the leading "/" as the key — S3 keys
+// can contain "/" and we just pass it through verbatim.
+func parseKey(p string) (string, bool) {
 	p = strings.TrimPrefix(p, "/")
-	i := strings.IndexByte(p, '/')
-	if i <= 0 || i == len(p)-1 {
-		return "", "", false
+	if p == "" {
+		return "", false
 	}
-	return p[:i], p[i+1:], true
+	return p, true
 }
 
 func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
@@ -106,9 +108,9 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bucket, key, ok := parsePath(r.URL.Path)
+	key, ok := parseKey(r.URL.Path)
 	if !ok {
-		http.Error(w, "expected /{bucket}/{key}", http.StatusBadRequest)
+		http.Error(w, "expected /{key}", http.StatusBadRequest)
 		return
 	}
 
@@ -119,7 +121,6 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logger := log.WithFields(log.Fields{
-		"bucket": bucket,
 		"key":    key,
 		"range":  r.Header.Get("Range"),
 		"method": r.Method,
@@ -130,7 +131,7 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 
 	// HEAD: just pull metadata from S3 (single HeadObject), return headers.
 	if r.Method == http.MethodHead {
-		if err := s.fetcher.Head(ctx, w, bucket, key); err != nil {
+		if err := s.fetcher.Head(ctx, w, key); err != nil {
 			logger.WithError(err).Warn("HEAD failed")
 			httpErrorFromS3(w, err)
 			requestsTotal.WithLabelValues("HEAD", "error").Inc()
@@ -141,7 +142,7 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	if err := s.fetcher.Get(ctx, w, bucket, key, start, end); err != nil {
+	if err := s.fetcher.Get(ctx, w, key, start, end); err != nil {
 		// If we've already written some bytes, just log; cannot reset response.
 		logger.WithError(err).WithField("elapsed", time.Since(t0)).Warn("GET failed")
 		requestsTotal.WithLabelValues("GET", "error").Inc()

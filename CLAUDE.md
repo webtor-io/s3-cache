@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Transparent S3 proxy for the [webtor.io](https://webtor.io) platform.
 
 Designed as the redirect target for `vault`: vault still resolves a
-`Resource` to a stored object hash, but instead of redirecting clients to a
-presigned upstream URL it redirects them here. Same path semantics
-(`/{bucket}/{key}`), HTTP-Range supported, opaque to thp's
+`Resource` to a stored object key, but instead of redirecting clients
+to a presigned upstream URL it redirects them here. Single-tenant —
+the bucket is fixed per s3-cache deploy via `AWS_BUCKET`, so URLs are
+`/{key}` (no bucket segment). HTTP-Range supported, opaque to thp's
 `redirectFollowingTransport` which just follows the 302.
 
 **Current state — MVP-2:**
@@ -54,7 +55,7 @@ No tests yet.
 |------|------|
 | `main.go` | urfave/cli app boot, logrus formatter |
 | `configure.go` | Wires `cs.Probe`, `cs.Prom`, `cs.Pprof`, `cs.S3Client`, `DiskCache`, `Readahead`, `Evictor`, `Fetcher`, `Web`; builds an `*http.Client` with HTTP/2 disabled and tight TTFB/handshake timeouts |
-| `services/web.go` | HTTP server, `/{bucket}/{key}` handler, Range parsing, dispatch |
+| `services/web.go` | HTTP server, `/{key}` handler, Range parsing, dispatch |
 | `services/fetcher.go` | `Head`, `Get`, `serveAligned`, `fetchChunk`, `fetchUncached`, `openRange` |
 | `services/cache.go` | `DiskCache.Get/Put` + sha1 shard distribution (`getDir`, `distributeByHash`) |
 | `services/eviction.go` | Bg per-shard LRU sweep (Servable) |
@@ -65,7 +66,7 @@ No tests yet.
 ### Request flow
 
 ```
-GET /{bucket}/{key}  Range: bytes=start-end
+GET /{key}  Range: bytes=start-end
         │
         ▼
   parsePath + parseRange
@@ -94,7 +95,7 @@ GET /{bucket}/{key}  Range: bytes=start-end
    fetchChunk(start, end, source):
      cache.Get → hit ⇒ return data (mtime touched for LRU)
                  miss ⇒ fall through, metric counted
-     singleflight.Do("$bucket/$key/$start"):
+     singleflight.Do("$key/$start"):
         openRange + ReadFull
         cache.Put (tmp file + atomic rename)
         return data
@@ -104,8 +105,8 @@ GET /{bucket}/{key}  Range: bytes=start-end
 ### Why these design choices
 
 - **Aligned chunks for everything** — cache keys on absolute aligned
-  offsets so the same (bucket, key, offset) tuple maps to the same disk
-  file across requests. A request-relative split (MVP-1's `multiRange`)
+  offsets so the same (key, offset) tuple maps to the same disk file
+  across requests. A request-relative split (MVP-1's `multiRange`)
   would only cache-hit on bit-exact replays. The cost is materialising
   one full chunk even for a sub-chunk-sized request, which is ~negligible
   compared to dialing upstream.
@@ -153,7 +154,7 @@ Common-services wiring:
 
 Local tunables:
 
-- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8)
+- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8), `AWS_BUCKET` (required — bucket is fixed per deploy)
 - Cache: `CACHE_ENABLED` (off by default — chart enables), `CACHE_DIR` (`/webtor/data*` — reuses TWS shard topology), `CACHE_SHARD_SUBDIR` (`s3-cache`)
 - Eviction: `EVICTION_MAX_BYTES` (10 GiB / shard), `EVICTION_INTERVAL` (1m)
 - Readahead: `READAHEAD_CHUNKS` (4), `READAHEAD_CONCURRENCY` (8), `READAHEAD_TIMEOUT` (30s)
@@ -189,7 +190,7 @@ under `data1/` is off-limits.
 ### Integration with vault
 
 `vault` reads `S3_CACHE_URL`. When set, its `/webseed/{id}/{path}` handler
-redirects clients to `${S3_CACHE_URL}/{bucket}/{key}` instead of presigning
+redirects clients to `${S3_CACHE_URL}/{key}` instead of presigning
 upstream. Empty value falls back to the legacy direct path — rollback is a
 single env unset, no code revert.
 
