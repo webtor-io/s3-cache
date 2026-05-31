@@ -114,7 +114,9 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	start, end, err := parseRange(r.Header.Get("Range"))
+	rangeHeader := r.Header.Get("Range")
+	rangeRequested := rangeHeader != ""
+	start, end, err := parseRange(rangeHeader)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -142,7 +144,7 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	if err := s.fetcher.Get(ctx, w, key, start, end); err != nil {
+	if err := s.fetcher.Get(ctx, w, key, start, end, rangeRequested); err != nil {
 		// If we've already written some bytes, just log; cannot reset response.
 		logger.WithError(err).WithField("elapsed", time.Since(t0)).Warn("GET failed")
 		requestsTotal.WithLabelValues("GET", "error").Inc()

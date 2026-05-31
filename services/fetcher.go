@@ -100,15 +100,15 @@ func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, key string) e
 	return nil
 }
 
-// Get serves a GET range request through the aligned-chunk path.
+// Get serves a GET (range) request through the aligned-chunk path.
 // end == -1 means "to the end" and forces a HEAD to discover totalSize.
-//
-// Unlike MVP-1's split between singleStream and multiRange, every request
-// now goes through aligned chunks — the cache keys on aligned offsets,
-// so request-relative offsets would defeat reuse across requests. For
-// sub-chunk-sized requests this still amounts to one upstream GET (one
-// chunk fetched, sliced to the requested span).
-func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, start, end int64) error {
+// rangeRequested distinguishes a true Range request from a plain GET —
+// the former gets 206 + Content-Range, the latter gets 200 + full
+// Content-Length. Returning 206 to a client that didn't send Range
+// trips up some HTTP clients and reverse-proxies (thp's redirect
+// follower notably gags on it) — that mismatch is what caused the
+// production 403s we saw on plain downloads.
+func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, start, end int64, rangeRequested bool) error {
 	totalSize := int64(-1)
 	if end < 0 {
 		hd, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
@@ -136,7 +136,7 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, st
 		return errors.New("empty range")
 	}
 
-	return f.serveAligned(ctx, w, key, start, end, totalSize)
+	return f.serveAligned(ctx, w, key, start, end, totalSize, rangeRequested)
 }
 
 // serveAligned splits [start..end] into chunkSize-aligned chunks
@@ -147,7 +147,7 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, st
 // Status commit is deferred until chunk 0 resolves: a pre-header
 // upstream failure yields a clean 502; failures on later chunks can
 // only abort an already-streaming response.
-func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key string, start, end, totalSize int64) error {
+func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key string, start, end, totalSize int64, rangeRequested bool) error {
 	chunkSize := f.chunkSize
 	firstChunkIdx := start / chunkSize
 	lastChunkIdx := end / chunkSize
@@ -226,9 +226,14 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 		return res0.err
 	}
 
-	contentRange := fmt.Sprintf("bytes %d-%d/%s", start, end, contentLenStr(totalSize))
+	contentRange := ""
+	status := http.StatusOK
+	if rangeRequested {
+		contentRange = fmt.Sprintf("bytes %d-%d/%s", start, end, contentLenStr(totalSize))
+		status = http.StatusPartialContent
+	}
 	writeRangeHeaders(w, contentRange, "", totalSize, start, end)
-	w.WriteHeader(http.StatusPartialContent)
+	w.WriteHeader(status)
 	flusher, _ := w.(http.Flusher)
 
 	if _, err := writeSliced(w, res0.data, res0.chunkStart, start, end); err != nil {
@@ -416,11 +421,13 @@ func (f *Fetcher) openRange(ctx context.Context, key string, start, end int64) (
 	return out.Body, cr, ct, nil
 }
 
+// writeRangeHeaders sets response headers for a successful GET.
+// contentRange="" signals "no Range was requested" — we omit
+// Content-Range entirely and let the WriteHeader caller emit 200.
+// Setting Content-Range on a 200 response confuses some HTTP clients.
 func writeRangeHeaders(w http.ResponseWriter, contentRange, contentType string, totalSize, start, end int64) {
 	if contentRange != "" {
 		w.Header().Set("Content-Range", contentRange)
-	} else if totalSize >= 0 {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
 	}
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	if contentType != "" {
