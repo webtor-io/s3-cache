@@ -305,7 +305,12 @@ func (f *Fetcher) fetchChunkWithRetry(ctx context.Context, bucket, key string, s
 // fetchChunkOnce does one S3 GetObject with Range, reads body with slow-detector.
 // Returns errSlowAbort if the slow-detector aborted before completion.
 func (f *Fetcher) fetchChunkOnce(ctx context.Context, bucket, key string, start, end, chunkLen int64) ([]byte, error) {
-	body, _, _, err := f.openRange(ctx, bucket, key, start, end)
+	// Local context so slow-detector can cancel just this attempt's S3 fetch
+	// (request + body read) without killing the surrounding multi-range request.
+	attemptCtx, attemptCancel := context.WithCancel(ctx)
+	defer attemptCancel()
+
+	body, _, _, err := f.openRange(attemptCtx, bucket, key, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -313,11 +318,13 @@ func (f *Fetcher) fetchChunkOnce(ctx context.Context, bucket, key string, start,
 
 	sd := newSlowDetector(f.slowBps, f.slowWindow)
 	defer sd.stop()
-
-	// Local context so slow-detector can cancel just this attempt's read without killing the request.
-	attemptCtx, attemptCancel := context.WithCancel(ctx)
-	defer attemptCancel()
-	sd.onSlow = attemptCancel
+	// onSlow cancels the attempt context (causes pending Read to fail) AND
+	// closes the body explicitly to break out of any in-flight read that
+	// the SDK isn't tying to ctx for whatever reason.
+	sd.onSlow = func() {
+		attemptCancel()
+		_ = body.Close()
+	}
 
 	rdr := sd.wrap(attemptCtx, body)
 	buf := make([]byte, chunkLen)
