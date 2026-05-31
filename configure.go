@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"time"
@@ -35,17 +36,23 @@ func run(c *cli.Context) error {
 			MaxIdleConns:        200,
 			MaxIdleConnsPerHost: 64,
 			IdleConnTimeout:     90 * time.Second,
-			ForceAttemptHTTP2:   true,
-			// Bound TTFB: if S3 doesn't return response headers in 5s, fail fast
+			// Force HTTP/1.1 only — under HTTP/2 all chunk streams share one TCP
+			// connection, so a per-host slowdown stalls every parallel worker at
+			// once and ResponseHeaderTimeout doesn't apply to H2 streams.
+			// One TCP per chunk gives independent congestion control + fresh dice
+			// odds against any per-connection rate variance.
+			ForceAttemptHTTP2: false,
+			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+			// Bound TTFB: if S3 doesn't return response headers in 3s, fail fast
 			// and let the chunk retry path kick in. Body reads are unaffected
 			// (slow-detector handles those).
-			ResponseHeaderTimeout: 5 * time.Second,
+			ResponseHeaderTimeout: 3 * time.Second,
 			// Bound TCP+TLS handshake similarly.
 			DialContext: (&net.Dialer{
-				Timeout:   5 * time.Second,
+				Timeout:   3 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
-			TLSHandshakeTimeout: 5 * time.Second,
+			TLSHandshakeTimeout: 3 * time.Second,
 		},
 	}
 
