@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	CacheDirFlag     = "cache-dir"
-	CacheEnabledFlag = "cache-enabled"
+	CacheDirFlag         = "cache-dir"
+	CacheEnabledFlag     = "cache-enabled"
+	CacheShardSubdirFlag = "cache-shard-subdir"
 )
 
 func RegisterCacheFlags(f []cli.Flag) []cli.Flag {
@@ -31,9 +32,16 @@ func RegisterCacheFlags(f []cli.Flag) []cli.Flag {
 		},
 		cli.StringFlag{
 			Name:   CacheDirFlag,
-			Usage:  "cache directory; trailing /* expands to all matching shards (sha1 distributed)",
-			Value:  "/cache/*",
+			Usage:  "cache root; trailing /* expands to all matching shards (sha1 distributed)",
+			Value:  "/webtor/data*",
 			EnvVar: "CACHE_DIR",
+		},
+		cli.StringFlag{
+			Name: CacheShardSubdirFlag,
+			Usage: "subdirectory inside each shard for our chunks; isolates eviction from " +
+				"sibling tenants (e.g. TWS torrent data under the same /webtor mount)",
+			Value:  "s3-cache",
+			EnvVar: "CACHE_SHARD_SUBDIR",
 		},
 	)
 }
@@ -49,6 +57,7 @@ func RegisterCacheFlags(f []cli.Flag) []cli.Flag {
 // complete chunk or no chunk — never a torn read.
 type DiskCache struct {
 	location string
+	subdir   string
 }
 
 // NewDiskCache returns nil when caching is disabled; callers must treat
@@ -57,16 +66,29 @@ func NewDiskCache(c *cli.Context) *DiskCache {
 	if !c.Bool(CacheEnabledFlag) {
 		return nil
 	}
-	return &DiskCache{location: c.String(CacheDirFlag)}
+	return &DiskCache{
+		location: c.String(CacheDirFlag),
+		subdir:   c.String(CacheShardSubdirFlag),
+	}
 }
 
-// Location returns the configured cache root (with optional trailing /*).
-// Used by the evictor to enumerate shards.
-func (c *DiskCache) Location() string {
+// CacheRoots returns the per-shard directories we own (i.e. shardDir +
+// subdir). The evictor walks exactly these — never the bare shardDir —
+// so sibling tenants under the same /webtor mount (TWS data, etc.)
+// are off-limits to eviction.
+func (c *DiskCache) CacheRoots() ([]string, error) {
 	if c == nil {
-		return ""
+		return nil, nil
 	}
-	return c.location
+	shards, err := listShards(c.location)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(shards))
+	for _, s := range shards {
+		out = append(out, filepath.Join(s, c.subdir))
+	}
+	return out, nil
 }
 
 func (c *DiskCache) path(bucket, key string, alignedOffset int64) (string, error) {
@@ -77,7 +99,7 @@ func (c *DiskCache) path(bucket, key string, alignedOffset int64) (string, error
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(shard, h[:2], h, fmt.Sprintf("chunk_%020d.bin", alignedOffset)), nil
+	return filepath.Join(shard, c.subdir, h[:2], h, fmt.Sprintf("chunk_%020d.bin", alignedOffset)), nil
 }
 
 // Get returns (data, nil) on hit, (nil, nil) on clean miss, or (nil, err)

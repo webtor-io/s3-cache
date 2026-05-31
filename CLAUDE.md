@@ -154,7 +154,7 @@ Common-services wiring:
 Local tunables:
 
 - Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8)
-- Cache: `CACHE_ENABLED` (off by default — chart enables), `CACHE_DIR` (`/cache/*`)
+- Cache: `CACHE_ENABLED` (off by default — chart enables), `CACHE_DIR` (`/webtor/data*` — reuses TWS shard topology), `CACHE_SHARD_SUBDIR` (`s3-cache`)
 - Eviction: `EVICTION_MAX_BYTES` (10 GiB / shard), `EVICTION_INTERVAL` (1m)
 - Readahead: `READAHEAD_CHUNKS` (4), `READAHEAD_CONCURRENCY` (8), `READAHEAD_TIMEOUT` (30s)
 
@@ -181,7 +181,10 @@ Kubernetes shape: **DaemonSet** on `webtor.io/worker-pool` nodes,
 
 Cache hostPath uses the **same `/webtor` mount as `torrent-web-seeder`
 and `content-transcoder`** (one disk allocation per node serves all
-three). Shards under `/webtor/s3-cache*`.
+three). We piggyback on TWS's `/webtor/data*` shard topology and
+own only the `s3-cache/` subdir inside each shard — eviction is
+scoped to that subdir, so TWS torrent data sitting next to us
+under `data1/` is off-limits.
 
 ### Integration with vault
 

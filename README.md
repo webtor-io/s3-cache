@@ -65,12 +65,15 @@ same node hit the same shaper. The cache is what decouples us.
 - **Pod-local** (`hostPath` on the DaemonSet, same `/webtor` mount as
   `torrent-web-seeder` and `content-transcoder` so one disk allocation
   per node serves all three).
-- **Sharded** by `sha1(bucket+"/"+key)` across `/webtor/s3-cache*`
-  subdirs (same wildcard-shard convention as content-transcoder's
-  `GetDir`). Single subdir is fine — the proxy creates `s3-cache1` on
-  first miss.
-- **Chunk file** at `<shard>/<sha1[:2]>/<sha1>/chunk_<offset:020d>.bin`.
-  Atomic writes via tmp file + rename — never serves a torn chunk.
+- **Shard topology piggybacks on TWS** — we read `/webtor/data*` to
+  pick a shard (same wildcard convention as content-transcoder's
+  `GetDir`), then own `<shard>/s3-cache/` for our own chunks. This
+  way s3-cache automatically follows whatever multi-disk layout the
+  node admin gave TWS, and eviction stays scoped to our subdir so
+  torrent data sitting next to us under `data1/` is never touched.
+- **Chunk file** at `/webtor/dataN/s3-cache/<sha1[:2]>/<sha1>/chunk_<offset:020d>.bin`
+  where `sha1 = sha1(bucket+"/"+key)`. Atomic writes via tmp file +
+  rename — never serves a torn chunk.
 - **LRU eviction**, **per-shard** size cap. `os.Chtimes` bumps mtime on
   every cache hit, and the evictor sweeps oldest-mtime files until each
   shard is below ~90% of the cap. Per-shard (not global) so one hot key
@@ -126,7 +129,8 @@ All settings via env vars (or matching CLI flags).
 | `CHUNK_SIZE` | 4194304 (4 MiB) | Chunk granularity (also cache granularity) |
 | `WORKERS` | 8 | Concurrent S3 fetches per request |
 | `CACHE_ENABLED` | `false` | Enable on-disk chunk cache |
-| `CACHE_DIR` | `/cache/*` | Cache root; trailing `/*` enables shard expansion |
+| `CACHE_DIR` | `/webtor/data*` | Cache shard roots (wildcard); piggybacks on TWS shards |
+| `CACHE_SHARD_SUBDIR` | `s3-cache` | Subdirectory inside each shard we own |
 | `EVICTION_MAX_BYTES` | 10737418240 (10 GiB) | Per-shard size cap (0 disables) |
 | `EVICTION_INTERVAL` | `1m` | Eviction sweep interval |
 | `READAHEAD_CHUNKS` | 4 | Chunks to prefetch past served range (0 disables) |

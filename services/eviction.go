@@ -70,7 +70,6 @@ func (e *Evictor) Serve() error {
 	log.WithFields(log.Fields{
 		"max_bytes_per_shard": e.maxBytes,
 		"interval":            e.interval,
-		"location":            e.cache.Location(),
 	}).Info("starting cache evictor")
 	// First sweep runs immediately so an over-cap cache from a previous
 	// pod incarnation gets trimmed before serving heats up.
@@ -86,17 +85,19 @@ func (e *Evictor) Serve() error {
 func (e *Evictor) Close() {}
 
 func (e *Evictor) runOnce() {
-	shards, err := listShards(e.cache.Location())
+	roots, err := e.cache.CacheRoots()
 	if err != nil {
-		log.WithError(err).Warn("eviction: list shards failed")
+		log.WithError(err).Warn("eviction: list cache roots failed")
 		return
 	}
-	if len(shards) == 0 {
-		// /cache/*  with no provisioned dirs — nothing to evict.
+	if len(roots) == 0 {
+		// No provisioned shards — nothing to evict. Note: we never walk
+		// the bare shard dir, only <shard>/<subdir>, so sibling tenants
+		// (TWS data under the same /webtor mount) are off-limits.
 		return
 	}
-	for _, sh := range shards {
-		e.sweepShard(sh)
+	for _, root := range roots {
+		e.sweepShard(root)
 	}
 	evictionRuns.Inc()
 }
