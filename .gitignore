@@ -1,0 +1,25 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output
+*.out
+*.db
+
+tmp
+
+s3-cache
+
+.idea
+
+# helmfile symlinks — chart/values live in infra/helmfile/, mirrored here for
+# convenience but not part of the public service repo.
+chart
+s3-cache.yaml.gotmpl
+.env

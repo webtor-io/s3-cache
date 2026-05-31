@@ -1,0 +1,5 @@
+.git
+s3-cache
+chart
+s3-cache.yaml.gotmpl
+.env
