@@ -51,42 +51,51 @@ func NewWeb(c *cli.Context, fetcher *Fetcher) *Web {
 	}
 }
 
-// parseRange parses "bytes=start-end" or "bytes=start-". Returns -1 for missing end.
+// parseRange parses "bytes=start-end", "bytes=start-" or the suffix form
+// "bytes=-N" (last N bytes). Returns end == -1 for missing end; suffixLen > 0
+// means the suffix form — start/end are resolved later against the object size.
 // Only supports single byte range (multi-range not supported — fine for our use case).
-func parseRange(h string) (start, end int64, err error) {
+func parseRange(h string) (start, end, suffixLen int64, err error) {
 	if h == "" {
-		return 0, -1, nil
+		return 0, -1, 0, nil
 	}
 	if !strings.HasPrefix(h, "bytes=") {
-		return 0, -1, errors.New("only bytes= ranges supported")
+		return 0, -1, 0, errors.New("only bytes= ranges supported")
 	}
 	spec := strings.TrimPrefix(h, "bytes=")
 	if strings.Contains(spec, ",") {
-		return 0, -1, errors.New("multi-range not supported")
+		return 0, -1, 0, errors.New("multi-range not supported")
 	}
 	parts := strings.SplitN(spec, "-", 2)
 	if len(parts) != 2 {
-		return 0, -1, errors.New("bad range")
+		return 0, -1, 0, errors.New("bad range")
 	}
 	if parts[0] == "" {
-		// suffix range "bytes=-N" — last N bytes; we don't support this without HEAD first
-		return 0, -1, errors.New("suffix range not supported")
+		suffixLen, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return 0, -1, 0, errors.Wrap(err, "bad suffix range")
+		}
+		if suffixLen <= 0 {
+			// "bytes=-0" is unsatisfiable per RFC 9110; negative is malformed.
+			return 0, -1, 0, errors.New("bad suffix range")
+		}
+		return 0, -1, suffixLen, nil
 	}
 	start, err = strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		return 0, -1, errors.Wrap(err, "bad range start")
+		return 0, -1, 0, errors.Wrap(err, "bad range start")
 	}
 	if parts[1] == "" {
-		return start, -1, nil
+		return start, -1, 0, nil
 	}
 	end, err = strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return 0, -1, errors.Wrap(err, "bad range end")
+		return 0, -1, 0, errors.Wrap(err, "bad range end")
 	}
 	if end < start {
-		return 0, -1, errors.New("end before start")
+		return 0, -1, 0, errors.New("end before start")
 	}
-	return start, end, nil
+	return start, end, 0, nil
 }
 
 // parseKey returns the S3 object key from the URL path. The bucket is
@@ -116,7 +125,7 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 
 	rangeHeader := r.Header.Get("Range")
 	rangeRequested := rangeHeader != ""
-	start, end, err := parseRange(rangeHeader)
+	start, end, suffixLen, err := parseRange(rangeHeader)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -144,7 +153,7 @@ func (s *Web) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	if err := s.fetcher.Get(ctx, w, key, start, end, rangeRequested); err != nil {
+	if err := s.fetcher.Get(ctx, w, key, start, end, suffixLen, rangeRequested); err != nil {
 		// If we've already written some bytes, just log; cannot reset response.
 		logger.WithError(err).WithField("elapsed", time.Since(t0)).Warn("GET failed")
 		requestsTotal.WithLabelValues("GET", "error").Inc()

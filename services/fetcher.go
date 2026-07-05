@@ -102,39 +102,61 @@ func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, key string) e
 }
 
 // Get serves a GET (range) request through the aligned-chunk path.
-// end == -1 means "to the end" and forces a HEAD to discover totalSize.
+// end == -1 means "to the end"; suffixLen > 0 means the "bytes=-N" suffix
+// form (last N bytes). A HEAD always runs first: the object size is needed
+// to resolve suffix ranges, clamp end, reject start-past-EOF with a proper
+// 416 and emit an honest total in Content-Range. Players (ffmpeg/AVPlayer)
+// and thp's retry layer parse `Content-Range: bytes */size` on 416 to tell
+// clean EOF from a real error — omitting it broke end-of-file playback of
+// vaulted content (see the 2026-07-05 Stremio incident).
 // rangeRequested distinguishes a true Range request from a plain GET —
 // the former gets 206 + Content-Range, the latter gets 200 + full
 // Content-Length. Returning 206 to a client that didn't send Range
 // trips up some HTTP clients and reverse-proxies (thp's redirect
 // follower notably gags on it) — that mismatch is what caused the
 // production 403s we saw on plain downloads.
-func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, start, end int64, rangeRequested bool) error {
-	totalSize := int64(-1)
-	if end < 0 {
-		hd, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(f.bucket),
-			Key:    aws.String(key),
-		})
-		if err != nil {
-			httpErrorFromS3(w, err)
-			return err
-		}
-		if hd.ContentLength == nil {
-			http.Error(w, "upstream missing Content-Length", http.StatusBadGateway)
-			return errors.New("upstream missing Content-Length")
-		}
-		totalSize = *hd.ContentLength
-		end = totalSize - 1
-		if hd.ContentType != nil {
-			w.Header().Set("Content-Type", *hd.ContentType)
-		}
+func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, start, end, suffixLen int64, rangeRequested bool) error {
+	hd, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(f.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		httpErrorFromS3(w, err)
+		return err
+	}
+	if hd.ContentLength == nil {
+		http.Error(w, "upstream missing Content-Length", http.StatusBadGateway)
+		return errors.New("upstream missing Content-Length")
+	}
+	totalSize := *hd.ContentLength
+	if hd.ContentType != nil {
+		w.Header().Set("Content-Type", *hd.ContentType)
 	}
 
-	wantLen := end - start + 1
-	if wantLen <= 0 {
-		http.Error(w, "empty range", http.StatusRequestedRangeNotSatisfiable)
-		return errors.New("empty range")
+	if suffixLen > 0 {
+		// "bytes=-N": last N bytes, clamped to the whole object.
+		start = totalSize - suffixLen
+		if start < 0 {
+			start = 0
+		}
+		end = totalSize - 1
+	}
+	if rangeRequested && start >= totalSize {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		return errors.Errorf("range not satisfiable: start=%d size=%d", start, totalSize)
+	}
+	if end < 0 || end > totalSize-1 {
+		end = totalSize - 1
+	}
+
+	if totalSize == 0 {
+		// Empty object: plain GET gets an empty 200; any Range on it is
+		// unsatisfiable and was rejected above.
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusOK)
+		return nil
 	}
 
 	return f.serveAligned(ctx, w, key, start, end, totalSize, rangeRequested)
