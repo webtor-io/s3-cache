@@ -78,7 +78,29 @@ func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *
 	}
 }
 
-// Head issues HeadObject and copies Content-Length / Content-Type / ETag to w.
+// setObjectHeaders copies Content-Type / ETag / Last-Modified from the
+// HeadObject result to w. Players resume interrupted streams with
+// If-Range/restart heuristics keyed on the validators — the TWS path
+// (http.ServeContent) always emits them, and their absence on the vault
+// path made KSPlayer restart from byte 0 instead of resuming (2026-07-06
+// end-of-episode drop). Content-Type is normalized: vault uploads carry
+// S3's default "binary/octet-stream", which is not a registered MIME type.
+func setObjectHeaders(w http.ResponseWriter, out *s3.HeadObjectOutput) {
+	ct := "application/octet-stream"
+	if out.ContentType != nil && *out.ContentType != "" && *out.ContentType != "binary/octet-stream" {
+		ct = *out.ContentType
+	}
+	w.Header().Set("Content-Type", ct)
+	if out.ETag != nil {
+		w.Header().Set("ETag", *out.ETag)
+	}
+	if out.LastModified != nil {
+		w.Header().Set("Last-Modified", out.LastModified.UTC().Format(http.TimeFormat))
+	}
+}
+
+// Head issues HeadObject and copies Content-Length / Content-Type / ETag /
+// Last-Modified to w.
 func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, key string) error {
 	out, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(f.bucket),
@@ -90,12 +112,7 @@ func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, key string) e
 	if out.ContentLength != nil {
 		w.Header().Set("Content-Length", strconv.FormatInt(*out.ContentLength, 10))
 	}
-	if out.ContentType != nil {
-		w.Header().Set("Content-Type", *out.ContentType)
-	}
-	if out.ETag != nil {
-		w.Header().Set("ETag", *out.ETag)
-	}
+	setObjectHeaders(w, out)
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusOK)
 	return nil
@@ -129,9 +146,7 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, st
 		return errors.New("upstream missing Content-Length")
 	}
 	totalSize := *hd.ContentLength
-	if hd.ContentType != nil {
-		w.Header().Set("Content-Type", *hd.ContentType)
-	}
+	setObjectHeaders(w, hd)
 
 	if suffixLen > 0 {
 		// "bytes=-N": last N bytes, clamped to the whole object.
