@@ -31,9 +31,9 @@ const (
 )
 
 // chunkFetchTimeout bounds a detached chunk fetch. Generous enough to ride
-// out OVH's per-connection throttle windows (2-3 MB/s for 20-30s → a 4 MiB
-// chunk still lands in ~2s, worst observed spans stay well under a minute),
-// tight enough that a wedged upstream doesn't pin worker goroutines forever.
+// out upstream per-connection throttle windows (worst observed spans stay
+// well under a minute), tight enough that a wedged upstream doesn't pin
+// worker goroutines forever.
 const chunkFetchTimeout = 90 * time.Second
 
 func RegisterFetcherFlags(f []cli.Flag) []cli.Flag {
@@ -454,12 +454,13 @@ func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, 
 	sfKey := fmt.Sprintf("%s/%d", key, start)
 	data, err, shared := f.sf.Do(sfKey, func() ([]byte, error) {
 		// Detached from the request context on purpose: an impatient client
-		// (KSPlayer aborts slow tail fetches within ~1s and retries) must not
+		// (players abort slow tail fetches within ~1s and retry) must not
 		// cancel the upstream fetch, or the chunk never lands in cache and
-		// every retry starts cold — under OVH's per-connection throttle that
-		// loops until the player gives up (the 2026-07 credits-drop storms).
-		// Let the fetch finish, cache the chunk, and the next retry is warm.
-		// Singleflight joiners are protected from inherited cancellation too.
+		// every retry starts cold — under upstream per-connection throttling
+		// that loops until the player gives up (the 2026-07 credits-drop
+		// storms). Let the fetch finish, cache the chunk, and the next retry
+		// is warm. Singleflight joiners are protected from inherited
+		// cancellation too.
 		dctx, cancel := context.WithTimeout(context.Background(), chunkFetchTimeout)
 		defer cancel()
 		return f.fetchUncached(dctx, key, start, end, source)
