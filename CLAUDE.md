@@ -45,7 +45,10 @@ go build -o server
 docker build -t s3-cache .
 ```
 
-No tests yet.
+```bash
+# Tests
+go test ./services/
+```
 
 ## Architecture
 
@@ -66,21 +69,29 @@ No tests yet.
 ### Request flow
 
 ```
-GET /{key}  Range: bytes=start-end
+GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
         │
         ▼
-  parsePath + parseRange
+  parsePath + parseRange (suffix form resolved later against object size)
         │
-   HEAD?  ─yes→  HeadObject → copy Content-Length / Type / ETag, 200
+   HEAD?  ─yes→  headObject (TTL cache) → copy Content-Length / Type / ETag / Last-Modified, 200
         │
-   end<0 (open range)? ─yes→  HEAD first to learn total size
+        ▼
+   headObject ALWAYS runs (TTL cache, default 60s; stale entry served as
+   fallback if the upstream HEAD fails — cached content stays servable
+   through upstream outages):
+     resolve suffix → absolute range, clamp end to size-1,
+     start >= size → 416 + "Content-Range: bytes */size"
+     validators (ETag/Last-Modified/normalized Content-Type) set on
+     success paths only, stripped before error statuses
         │
         ▼
    serveAligned:
      firstChunkIdx = start / chunkSize  (absolute alignment, not request-relative)
      lastChunkIdx  = end   / chunkSize
      pending[]chan, jobs<-, N workers (default 8)
-     slot semaphore (workers*2) caps in-flight chunks → bounded RAM
+     slot semaphore (=workers, min 4) caps in-flight chunks → bounded RAM
+     workers re-check ctx after slot acquire (no new work post-abort)
      workers call fetchChunk(absChunkIdx * chunkSize, ...)
      wait for pending[0]:
         err → cancel + httpErrorFromS3 → return err (502)
@@ -95,11 +106,15 @@ GET /{key}  Range: bytes=start-end
    fetchChunk(start, end, source):
      cache.Get → hit ⇒ return data (mtime touched for LRU)
                  miss ⇒ fall through, metric counted
-     singleflight.Do("$key/$start"):
-        openRange + ReadFull
+     spawn goroutine: singleflight.Do("$key/$start"):
+        acquire fetchSem (process-wide FETCH_CONCURRENCY cap)
+        detached ctx (CHUNK_FETCH_TIMEOUT, default 90s) — NOT the request ctx
+        openRange + ReadFull (short read = error, never cached)
         cache.Put (tmp file + atomic rename)
         return data
-     return data
+     select { result | caller ctx.Done }   ← wait is cancellable; an aborted
+     caller returns immediately while the fetch finishes in the background
+     and warms the cache for the next retry
 ```
 
 ### Why these design choices
@@ -127,6 +142,28 @@ GET /{key}  Range: bytes=start-end
   gives independent congestion control.
 - **TTFB / dial / TLS timeouts of 3s each** — stuck connections fail fast,
   the upstream then errors out rather than hanging the chunk forever.
+- **Detached chunk fetches (do NOT re-attach them to the request ctx)** —
+  the S3 fetch inside singleflight runs under its own `CHUNK_FETCH_TIMEOUT`
+  context, not the request's. Impatient players abort slow tail fetches
+  within ~1s and retry; with request-ctx fetches the abort cancelled the
+  fetch, the chunk never reached the cache, and every retry started cold —
+  under upstream per-connection throttling that looped until the player
+  gave up (the 2026-07 credits-drop storms). The caller's WAIT on the
+  result stays cancellable (select on ctx), so aborted requests return
+  immediately while the orphaned fetch completes, caches, and warms the
+  next retry. Buildup is bounded by the process-wide `FETCH_CONCURRENCY`
+  semaphore.
+- **Short chunk reads are errors, never cached** — the requested span is
+  always clamped to the object end, so a short body means upstream failure;
+  caching it would poison every response over that offset until eviction.
+- **HeadObject through a TTL cache with stale fallback** — object metadata
+  is immutable (content-addressed keys), so HEADs are cached
+  (`HEAD_CACHE_TTL`); when a HEAD fails and a stale entry exists it is
+  served instead, keeping fully-disk-cached content servable through
+  upstream outages.
+- **Validators on success responses only** — ETag/Last-Modified/normalized
+  Content-Type are emitted for players' resume heuristics (If-Range /
+  restart-from-zero avoidance) and stripped before error statuses.
 - **No slow-detector, no retries** — empirically the upstream's
   rate-limit is per-source-IP. Aborting a "slow" connection and reopening
   another from the same node hits the same shaper. Cache is what
@@ -161,7 +198,7 @@ Common-services wiring:
 
 Local tunables:
 
-- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8), `AWS_BUCKET` (required — bucket is fixed per deploy)
+- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8), `AWS_BUCKET` (required — bucket is fixed per deploy), `FETCH_CONCURRENCY` (32, process-wide cap on concurrent upstream chunk fetches), `CHUNK_FETCH_TIMEOUT` (90s, detached fetch deadline), `HEAD_CACHE_TTL` (60s)
 - Cache: `CACHE_ENABLED` (off by default — chart enables), `CACHE_DIR` (`/webtor/data*` — reuses TWS shard topology), `CACHE_SHARD_SUBDIR` (`s3-cache`)
 - Eviction: `EVICTION_MAX_BYTES` (10 GiB / shard), `EVICTION_INTERVAL` (1m)
 - Readahead: `READAHEAD_CHUNKS` (4), `READAHEAD_CONCURRENCY` (8), `READAHEAD_TIMEOUT` (30s)

@@ -20,21 +20,18 @@ import (
 )
 
 const (
-	ChunkSizeFlag = "chunk-size"
-	WorkersFlag   = "workers"
-	BucketFlag    = "aws-bucket"
+	ChunkSizeFlag         = "chunk-size"
+	WorkersFlag           = "workers"
+	BucketFlag            = "aws-bucket"
+	FetchConcurrencyFlag  = "fetch-concurrency"
+	ChunkFetchTimeoutFlag = "chunk-fetch-timeout"
+	HeadCacheTTLFlag      = "head-cache-ttl"
 )
 
 const (
 	sourceForeground = "foreground"
 	sourceReadahead  = "readahead"
 )
-
-// chunkFetchTimeout bounds a detached chunk fetch. Generous enough to ride
-// out upstream per-connection throttle windows (worst observed spans stay
-// well under a minute), tight enough that a wedged upstream doesn't pin
-// worker goroutines forever.
-const chunkFetchTimeout = 90 * time.Second
 
 func RegisterFetcherFlags(f []cli.Flag) []cli.Flag {
 	return append(f,
@@ -55,17 +52,38 @@ func RegisterFetcherFlags(f []cli.Flag) []cli.Flag {
 			Usage:  "S3 bucket to serve from (single-tenant: bucket is fixed by config, not in URL)",
 			EnvVar: "AWS_BUCKET",
 		},
+		cli.IntFlag{
+			Name:   FetchConcurrencyFlag,
+			Usage:  "process-wide cap on concurrent upstream chunk fetches (bounds detached-fetch buildup under abort storms)",
+			Value:  32,
+			EnvVar: "FETCH_CONCURRENCY",
+		},
+		cli.DurationFlag{
+			Name:   ChunkFetchTimeoutFlag,
+			Usage:  "deadline for one detached chunk fetch; generous enough to ride out upstream per-connection throttle windows",
+			Value:  90 * time.Second,
+			EnvVar: "CHUNK_FETCH_TIMEOUT",
+		},
+		cli.DurationFlag{
+			Name:   HeadCacheTTLFlag,
+			Usage:  "TTL for cached HeadObject metadata (objects are immutable; stale entries also serve as fallback during upstream outages)",
+			Value:  60 * time.Second,
+			EnvVar: "HEAD_CACHE_TTL",
+		},
 	)
 }
 
 type Fetcher struct {
-	s3cl      *cs.S3Client
-	bucket    string
-	chunkSize int64
-	workers   int
-	cache     *DiskCache
-	sf        *singleflight
-	readahead *Readahead
+	s3cl              *cs.S3Client
+	bucket            string
+	chunkSize         int64
+	workers           int
+	cache             *DiskCache
+	sf                *singleflight
+	readahead         *Readahead
+	fetchSem          chan struct{}
+	chunkFetchTimeout time.Duration
+	heads             *headCache
 }
 
 func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *Readahead) *Fetcher {
@@ -74,14 +92,42 @@ func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *
 		log.Fatal("AWS_BUCKET is required")
 	}
 	return &Fetcher{
-		s3cl:      s3cl,
-		bucket:    bucket,
-		chunkSize: c.Int64(ChunkSizeFlag),
-		workers:   c.Int(WorkersFlag),
-		cache:     cache,
-		sf:        newSingleflight(),
-		readahead: readahead,
+		s3cl:              s3cl,
+		bucket:            bucket,
+		chunkSize:         c.Int64(ChunkSizeFlag),
+		workers:           c.Int(WorkersFlag),
+		cache:             cache,
+		sf:                newSingleflight(),
+		readahead:         readahead,
+		fetchSem:          make(chan struct{}, c.Int(FetchConcurrencyFlag)),
+		chunkFetchTimeout: c.Duration(ChunkFetchTimeoutFlag),
+		heads:             newHeadCache(c.Duration(HeadCacheTTLFlag)),
 	}
+}
+
+// headObject returns object metadata through a TTL cache. Objects are
+// content-addressed and immutable, so a fresh entry short-circuits the
+// upstream HEAD every GET would otherwise pay. When the upstream HEAD
+// fails and a stale entry exists, the stale entry is served instead —
+// fully-disk-cached content must stay servable through upstream outages
+// (the cache exists to decouple serving from the upstream).
+func (f *Fetcher) headObject(ctx context.Context, key string) (*s3.HeadObjectOutput, error) {
+	if out, fresh := f.heads.get(key); fresh {
+		return out, nil
+	}
+	out, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(f.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if stale, _ := f.heads.get(key); stale != nil {
+			log.WithError(err).WithField("key", key).Warn("HEAD failed, serving stale metadata")
+			return stale, nil
+		}
+		return nil, err
+	}
+	f.heads.put(key, out)
+	return out, nil
 }
 
 // setObjectHeaders copies Content-Type / ETag / Last-Modified from the
@@ -105,13 +151,10 @@ func setObjectHeaders(w http.ResponseWriter, out *s3.HeadObjectOutput) {
 	}
 }
 
-// Head issues HeadObject and copies Content-Length / Content-Type / ETag /
-// Last-Modified to w.
+// Head serves object metadata (through the TTL head cache) and copies
+// Content-Length / Content-Type / ETag / Last-Modified to w.
 func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, key string) error {
-	out, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(f.bucket),
-		Key:    aws.String(key),
-	})
+	out, err := f.headObject(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -139,10 +182,7 @@ func (f *Fetcher) Head(ctx context.Context, w http.ResponseWriter, key string) e
 // follower notably gags on it) — that mismatch is what caused the
 // production 403s we saw on plain downloads.
 func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, start, end, suffixLen int64, rangeRequested bool) error {
-	hd, err := f.s3cl.Get().HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(f.bucket),
-		Key:    aws.String(key),
-	})
+	hd, err := f.headObject(ctx, key)
 	if err != nil {
 		httpErrorFromS3(w, err)
 		return err
@@ -152,7 +192,6 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, st
 		return errors.New("upstream missing Content-Length")
 	}
 	totalSize := *hd.ContentLength
-	setObjectHeaders(w, hd)
 
 	if suffixLen > 0 {
 		// "bytes=-N": last N bytes, clamped to the whole object.
@@ -170,6 +209,10 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, st
 	if end < 0 || end > totalSize-1 {
 		end = totalSize - 1
 	}
+
+	// Validators go on success responses only — past the 416 gate, so error
+	// bodies don't claim ETag/Last-Modified for content that was not served.
+	setObjectHeaders(w, hd)
 
 	if totalSize == 0 {
 		// Empty object: plain GET gets an empty 200; any Range on it is
@@ -241,6 +284,13 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 					pending[idx] <- chunkResult{err: ctx.Err()}
 					return
 				}
+				// The select above picks pseudo-randomly when both cases are
+				// ready (cleanupPending refills slots after cancel) — don't
+				// start new upstream work for a request that's already gone.
+				if ctx.Err() != nil {
+					pending[idx] <- chunkResult{err: ctx.Err()}
+					return
+				}
 				absChunkIdx := firstChunkIdx + int64(idx)
 				cStart := absChunkIdx * chunkSize
 				cEnd := cStart + chunkSize - 1
@@ -268,6 +318,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 		cleanupPending(slots, pending)
 		wg.Wait()
 		cleanupPending(slots, pending)
+		dropValidatorHeaders(w)
 		http.Error(w, "request cancelled", http.StatusBadGateway)
 		return ctx.Err()
 	}
@@ -276,6 +327,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 		cleanupPending(slots, pending)
 		wg.Wait()
 		cleanupPending(slots, pending)
+		dropValidatorHeaders(w)
 		httpErrorFromS3(w, res0.err)
 		return res0.err
 	}
@@ -283,7 +335,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	contentRange := ""
 	status := http.StatusOK
 	if rangeRequested {
-		contentRange = fmt.Sprintf("bytes %d-%d/%s", start, end, contentLenStr(totalSize))
+		contentRange = fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize)
 		status = http.StatusPartialContent
 	}
 	writeRangeHeaders(w, contentRange, "", totalSize, start, end)
@@ -451,27 +503,60 @@ func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, 
 		cacheLookups.WithLabelValues("miss").Inc()
 	}
 
+	if ctx.Err() != nil {
+		return chunkResult{}, ctx.Err()
+	}
+
+	// The upstream fetch is detached from the request context on purpose:
+	// an impatient client (players abort slow tail fetches within ~1s and
+	// retry) must not cancel it, or the chunk never lands in cache and every
+	// retry starts cold — under upstream per-connection throttling that
+	// loops until the player gives up (the 2026-07 credits-drop storms).
+	// The WAIT below stays cancellable though: an aborted caller returns
+	// immediately while the fetch finishes in the background (bounded by
+	// fetchSem + chunkFetchTimeout) and warms the cache for the next retry.
 	sfKey := fmt.Sprintf("%s/%d", key, start)
-	data, err, shared := f.sf.Do(sfKey, func() ([]byte, error) {
-		// Detached from the request context on purpose: an impatient client
-		// (players abort slow tail fetches within ~1s and retry) must not
-		// cancel the upstream fetch, or the chunk never lands in cache and
-		// every retry starts cold — under upstream per-connection throttling
-		// that loops until the player gives up (the 2026-07 credits-drop
-		// storms). Let the fetch finish, cache the chunk, and the next retry
-		// is warm. Singleflight joiners are protected from inherited
-		// cancellation too.
-		dctx, cancel := context.WithTimeout(context.Background(), chunkFetchTimeout)
-		defer cancel()
-		return f.fetchUncached(dctx, key, start, end, source)
-	})
-	if shared {
-		singleflightShared.Inc()
+	type sfOut struct {
+		data   []byte
+		err    error
+		shared bool
 	}
-	if err != nil {
-		return chunkResult{}, err
+	done := make(chan sfOut, 1)
+	go func() {
+		data, err, shared := f.sf.Do(sfKey, func() ([]byte, error) {
+			dctx, cancel := context.WithTimeout(context.Background(), f.chunkFetchTimeout)
+			defer cancel()
+			select {
+			case f.fetchSem <- struct{}{}:
+			case <-dctx.Done():
+				return nil, errors.New("chunk fetch queue timeout")
+			}
+			defer func() { <-f.fetchSem }()
+			return f.fetchUncached(dctx, key, start, end, source)
+		})
+		done <- sfOut{data: data, err: err, shared: shared}
+	}()
+
+	select {
+	case out := <-done:
+		if out.shared {
+			singleflightShared.Inc()
+		}
+		if out.err != nil {
+			return chunkResult{}, out.err
+		}
+		return chunkResult{data: out.data, chunkStart: start}, nil
+	case <-ctx.Done():
+		return chunkResult{}, ctx.Err()
 	}
-	return chunkResult{data: data, chunkStart: start}, nil
+}
+
+// dropValidatorHeaders strips ETag/Last-Modified before an error status is
+// written — error bodies must not claim validators for content that was
+// never served.
+func dropValidatorHeaders(w http.ResponseWriter) {
+	w.Header().Del("ETag")
+	w.Header().Del("Last-Modified")
 }
 
 // fetchUncached pulls bytes from S3 and writes them to cache. Cache
@@ -487,13 +572,18 @@ func (f *Fetcher) fetchUncached(ctx context.Context, key string, start, end int6
 
 	buf := make([]byte, end-start+1)
 	n, err := io.ReadFull(body, buf)
-	if err != nil && err != io.ErrUnexpectedEOF {
+	if err != nil {
+		// A short read is an upstream failure, never a valid chunk — the
+		// requested span is always clamped to the object end, so anything
+		// less than the full buffer must NOT reach the cache (a truncated
+		// cached chunk poisons every response over this offset until
+		// eviction).
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, errors.Wrap(err, "read chunk body")
+		return nil, errors.Wrapf(err, "read chunk body: got %d of %d bytes", n, len(buf))
 	}
-	data := buf[:n]
+	data := buf
 	upstreamChunkDuration.WithLabelValues(source).Observe(time.Since(t0).Seconds())
 	upstreamBytesFetched.Add(float64(n))
 
@@ -546,11 +636,4 @@ func writeRangeHeaders(w http.ResponseWriter, contentRange, contentType string, 
 		w.Header().Set("Content-Type", contentType)
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
-}
-
-func contentLenStr(total int64) string {
-	if total < 0 {
-		return "*"
-	}
-	return strconv.FormatInt(total, 10)
 }
