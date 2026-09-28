@@ -75,6 +75,11 @@ var (
 		Help: "Chunk fetches that had to wait for buffer budget.",
 	})
 
+	stalledWriteCuts = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "s3cache_stalled_writes_cut_total",
+		Help: "Responses cut off because the client did not take a chunk within the write deadline while the request held chunk-buffer budget.",
+	})
+
 	chunkServes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "s3cache_chunk_serves_total",
 		Help: "Chunks written to clients, by where the bytes came from.",

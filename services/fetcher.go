@@ -83,6 +83,11 @@ type Fetcher struct {
 	readahead         *Readahead
 	budget            *chunkBudget
 	chunkFetchTimeout time.Duration
+	// writeGuardTimeout bounds one chunk write while the request holds
+	// chunk-buffer budget (see writeGuard). Half the fetch deadline: a
+	// fetch queued behind a stalled holder still gets a unit with time
+	// left to download.
+	writeGuardTimeout time.Duration
 	heads             *headCache
 
 	flights  atomic.Int64      // published flights not yet released (leak checks in tests)
@@ -105,6 +110,7 @@ func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *
 		readahead:         readahead,
 		budget:            newChunkBudget(c.Int(FetchConcurrencyFlag), chunkSize),
 		chunkFetchTimeout: c.Duration(ChunkFetchTimeoutFlag),
+		writeGuardTimeout: c.Duration(ChunkFetchTimeoutFlag) / 2,
 		heads:             newHeadCache(c.Duration(HeadCacheTTLFlag)),
 	}
 }
@@ -262,6 +268,8 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	guard := newWriteGuard(http.NewResponseController(w), f.writeGuardTimeout)
+
 	// The dispatcher starts chunk fetches strictly in order and admits
 	// chunk i+1 only once chunk i no longer waits for buffer budget (cache
 	// hit, or its fetch holds a unit). Without the ordering a request could
@@ -304,6 +312,11 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 					cr = chunkResult{err: err}
 				}
 				cr.chunkStart = cStart
+				// A buffered chunk pins budget until it is written: count it
+				// before the hand-off (see writeGuard).
+				if cr.via == viaBuffer {
+					guard.hold()
+				}
 				pending[idx] <- cr
 			}(idx)
 			select {
@@ -346,9 +359,8 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	}
 	writeRangeHeaders(w, contentRange, "", totalSize, start, end)
 	w.WriteHeader(status)
-	flusher, _ := w.(http.Flusher)
 
-	_, err := res0.writeSlice(w, start, end)
+	err := writeChunk(w, guard, &res0, start, end)
 	via := res0.via
 	res0.close()
 	if err != nil {
@@ -357,9 +369,6 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	}
 	chunkServes.WithLabelValues(via).Inc()
 	<-slots
-	if flusher != nil {
-		flusher.Flush()
-	}
 
 	for i := 1; i < nChunks; i++ {
 		select {
@@ -371,7 +380,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 				abort()
 				return res.err
 			}
-			_, err := res.writeSlice(w, start, end)
+			err := writeChunk(w, guard, &res, start, end)
 			via := res.via
 			res.close()
 			if err != nil {
@@ -380,9 +389,6 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 			}
 			chunkServes.WithLabelValues(via).Inc()
 			<-slots
-			if flusher != nil {
-				flusher.Flush()
-			}
 		case <-ctx.Done():
 			abort()
 			return ctx.Err()
