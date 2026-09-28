@@ -66,6 +66,9 @@ type fakeS3 struct {
 	gets     atomic.Int64
 	heads    atomic.Int64
 	getDelay time.Duration
+	// review: GETs of keys containing "fail" whose range starts at or past
+	// failFrom are refused with 403 (not retried by the SDK).
+	failFrom int64
 }
 
 func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -109,6 +112,12 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if end > size-1 {
 				end = size - 1
+			}
+			if s.failFrom > 0 && strings.Contains(key, "fail") && start >= s.failFrom {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>denied</Message></Error>`)
+				return
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			status = http.StatusPartialContent
