@@ -59,11 +59,13 @@ go test ./services/
 | `main.go` | urfave/cli app boot, logrus formatter |
 | `configure.go` | Wires `cs.Probe`, `cs.Prom`, `cs.Pprof`, `cs.S3Client`, `DiskCache`, `Readahead`, `Evictor`, `Fetcher`, `Web`; builds an `*http.Client` with HTTP/2 disabled and tight TTFB/handshake timeouts |
 | `services/web.go` | HTTP server, `/{key}` handler, Range parsing, dispatch |
-| `services/fetcher.go` | `Head`, `Get`, `serveAligned`, `fetchChunk`, `fetchUncached`, `openRange` |
+| `services/fetcher.go` | `Head`, `Get`, `serveAligned` (in-order chunk dispatcher), `fetchChunk`, `lead` (detached upstream fetch + cache write), `download`, `openRange` |
+| `services/chunk.go` | `chunkFlight` (shared fetch outcome, refcounted), `chunkResult` (per-consumer handle / section / buffer), `writeSlice` |
+| `services/budget.go` | `chunkBudget` — global FIFO cap on chunk buffers in memory (`FETCH_CONCURRENCY` chunks) |
 | `services/cache.go` | `DiskCache.Get/Put` + sha1 shard distribution (`getDir`, `distributeByHash`) |
 | `services/eviction.go` | Bg per-shard LRU sweep (Servable) |
 | `services/readahead.go` | Best-effort sequential prefetch with bounded concurrency |
-| `services/singleflight.go` | Minimal in-process dedup for chunk fetches |
+| `services/singleflight.go` | In-process dedup for chunk fetches; publishes the result with one reference per caller |
 | `services/metrics.go` | Prometheus counters / histograms / gauges (`promauto`) |
 
 ### Request flow
@@ -89,10 +91,12 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
    serveAligned:
      firstChunkIdx = start / chunkSize  (absolute alignment, not request-relative)
      lastChunkIdx  = end   / chunkSize
-     pending[]chan, jobs<-, N workers (default 8)
-     slot semaphore (=workers, min 4) caps in-flight chunks → bounded RAM
-     workers re-check ctx after slot acquire (no new work post-abort)
-     workers call fetchChunk(absChunkIdx * chunkSize, ...)
+     dispatcher, chunks strictly in order:
+        take a slot (window = workers, min 4; freed when the chunk is written)
+        re-check ctx (no new work post-abort)
+        go fetchChunk(absChunkIdx * chunkSize, ..., admit) → pending[idx]
+        wait until that chunk is ADMITTED (hit, or its fetch holds a budget
+        unit) before starting the next one
      wait for pending[0]:
         err → cancel + httpErrorFromS3 → return err (502)
         ok  → write {200 if no Range else 206} + headers + sliced chunk 0 bytes
@@ -103,18 +107,25 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
      readahead.Kick(bucket, key, lastChunkIdx+1, totalSize)
         │
         ▼
-   fetchChunk(start, end, source):
-     cache.Get → hit ⇒ return data (mtime touched for LRU)
+   fetchChunk(start, end, source, admit):
+     cache.Get → hit ⇒ admit, return own *os.File (mtime touched for LRU)
                  miss ⇒ fall through, metric counted
-     spawn goroutine: singleflight.Do("$key/$start"):
-        acquire fetchSem (process-wide FETCH_CONCURRENCY cap)
+     singleflight.join("$key/$start"); the leader spawns lead():
         detached ctx (CHUNK_FETCH_TIMEOUT, default 90s) — NOT the request ctx
-        openRange + ReadFull (short read = error, never cached)
-        cache.Put (tmp file + atomic rename)
-        return data
-     select { result | caller ctx.Done }   ← wait is cancellable; an aborted
-     caller returns immediately while the fetch finishes in the background
-     and warms the cache for the next retry
+        acquire a budget unit (global FIFO, FETCH_CONCURRENCY units) → admitted
+        openRange + ReadFull into a budgeted buffer (short read = error, never cached)
+        cache.Put (tmp file + atomic rename; returns the still-open handle)
+          ok   ⇒ drop the buffer, release the unit; result = path + pinned handle
+          fail ⇒ result = the buffer; unit released when the last reader is done
+        finish: result published with refs = number of callers that joined
+     claim goroutine (outlives the caller): per caller —
+        cached ⇒ os.Open(path) own handle (sendfile), drop ref
+                 open failed (evicted) ⇒ SectionReader over the pinned handle
+        buffer ⇒ share it, ref dropped by chunkResult.close()
+        hand over to the caller, or close it here if the caller is gone
+     select { admitted | ctx.Done }, then { result | ctx.Done } — the wait is
+     cancellable; an aborted caller returns immediately while the fetch
+     finishes in the background and warms the cache for the next retry
 ```
 
 ### Why these design choices
@@ -151,8 +162,8 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
   gave up (the 2026-07 credits-drop storms). The caller's WAIT on the
   result stays cancellable (select on ctx), so aborted requests return
   immediately while the orphaned fetch completes, caches, and warms the
-  next retry. Buildup is bounded by the process-wide `FETCH_CONCURRENCY`
-  semaphore.
+  next retry. Buildup is bounded by the chunk-buffer budget
+  (`FETCH_CONCURRENCY`).
 - **Short chunk reads are errors, never cached** — the requested span is
   always clamped to the object end, so a short body means upstream failure;
   caching it would poison every response over that offset until eviction.
@@ -172,10 +183,45 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
   per-chunk handshake + SigV4 overhead is negligible. **Also the cache
   granularity** — changing it after a cache exists requires draining
   the cache dirs.
-- **Slot semaphore at `workers*2`** — caps how far workers can race ahead
-  of the consumer. Without it, a 1 GiB file fanned out at 4 MiB chunks
-  could materialise ~250 chunks in RAM before the client drains. With
-  it: ≤ `workers*2 * chunkSize` transient (≈ 64 MiB at defaults).
+- **Cache misses are served from the cache file, not from memory** — after
+  a successful `Put` the download buffer is dropped and every caller opens
+  its own handle on the file, exactly like a hit. Production incident
+  2026-09-28 (worker62): misses kept each 4 MiB chunk as `[]byte` until the
+  consumer drained it, up to a window of 8 chunks per request; ~70 slow
+  downloads (5 Mbit/s multi-connection downloaders, vault tar archives)
+  held 1.5 GB of heap (98.9% in the fetch path), GC thrashed at the 2-core
+  limit, 1 s probes timed out, 4 kills incl. one OOMKill. A local replay
+  (70 clients at 5 Mbit/s, 4 MiB chunks, FETCH_CONCURRENCY 32): live heap
+  1690 MiB before, 13 MiB after.
+- **Own handle per consumer, pinned handle as fallback** — Linux sendfile
+  reads from and advances the descriptor's own file offset, so a shared
+  (or dup'ed) descriptor can't serve concurrent consumers. `Put` returns
+  the handle it wrote through; it keeps the inode alive if the evictor
+  unlinks the path before a consumer's `os.Open` — that consumer reads the
+  pinned handle through a `SectionReader` (pread; no sendfile, no heap).
+- **Global chunk-buffer budget (`FETCH_CONCURRENCY` chunks)** — every chunk
+  buffer, download in progress or uncached chunk awaiting its consumer,
+  takes a unit; heap in chunk buffers ≤ `FETCH_CONCURRENCY × CHUNK_SIZE`
+  (128 MiB at defaults) regardless of the number of clients. It replaced
+  `fetchSem`, which counted downloads only. Waiters are FIFO (Go channel
+  send queue), no barging.
+- **Budget admission in chunk order per request** — the dispatcher starts
+  chunk i+1 only once chunk i is admitted. Otherwise later chunks of a
+  request can hold the whole budget (buffers only its own consumer
+  releases) while its head chunk queues for it; in the test with a
+  2-chunk budget and 24 requests that deadlocked every request until the
+  fetch timeout (24 × 502). With the ordering, whoever holds budget has
+  every earlier chunk in hand or in progress, so its consumer advances.
+- **Trade-off of the budget when chunks can't be cached** (cache disabled,
+  `Put` failing, e.g. a full disk): buffers wait for their consumers, so
+  clients that stop reading (paused players behind thp) hold units — up to
+  the window (8) each; 4 stalled clients take the default budget and other
+  misses queue (FIFO) until someone reads or `CHUNK_FETCH_TIMEOUT` → 502.
+  Hits and cached misses are unaffected. Before, the same situation grew
+  the heap without bound. Watch `s3cache_chunk_serves_total{via="buffer"}`
+  and `s3cache_chunk_budget_waits_total`.
+- **Slot window = `workers` (min 4)** — caps how far fetches run ahead of
+  the consumer (file handles, and buffers when uncached) per request.
 - **Per-shard size cap, not global** — one hot key family can't starve
   evenly-distributed traffic across other shards. Sweep deletes oldest-
   mtime first; `cache.Get` does `os.Chtimes(now)` so mtime tracks
@@ -198,7 +244,7 @@ Common-services wiring:
 
 Local tunables:
 
-- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8), `AWS_BUCKET` (required — bucket is fixed per deploy), `FETCH_CONCURRENCY` (32, process-wide cap on concurrent upstream chunk fetches), `CHUNK_FETCH_TIMEOUT` (90s, detached fetch deadline), `HEAD_CACHE_TTL` (60s)
+- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8), `AWS_BUCKET` (required — bucket is fixed per deploy), `FETCH_CONCURRENCY` (32, process-wide cap on chunk buffers in memory — downloads in progress plus uncached chunks awaiting consumers; heap bound = this × `CHUNK_SIZE`), `CHUNK_FETCH_TIMEOUT` (90s, detached fetch deadline), `HEAD_CACHE_TTL` (60s)
 - Cache: `CACHE_ENABLED` (off by default — chart enables), `CACHE_DIR` (`/webtor/data*` — reuses TWS shard topology), `CACHE_SHARD_SUBDIR` (`s3-cache`)
 - Eviction: `EVICTION_MAX_BYTES` (10 GiB / shard), `EVICTION_INTERVAL` (1m)
 - Readahead: `READAHEAD_CHUNKS` (4), `READAHEAD_CONCURRENCY` (8), `READAHEAD_TIMEOUT` (30s)

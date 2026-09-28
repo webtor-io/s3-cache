@@ -89,6 +89,11 @@ same node hit the same shaper. The cache is what decouples us.
   every cache hit, and the evictor sweeps oldest-mtime files until each
   shard is below ~90% of the cap. Per-shard (not global) so one hot key
   family can't starve evenly-distributed traffic.
+- **Misses are served from the cache file** — once a fetched chunk is on
+  disk its buffer is dropped and clients stream the file (sendfile), like
+  a hit; slow clients cost a file handle, not 4 MiB of heap per chunk.
+  Chunks that can't be cached are held in memory under a global budget of
+  `FETCH_CONCURRENCY` chunks.
 - **Singleflight dedup** — concurrent identical chunk misses collapse to
   one upstream GET. Typical for HLS where N viewers want the same
   segment simultaneously.
@@ -140,7 +145,10 @@ All settings via env vars (or matching CLI flags).
 | `AWS_NO_SSL` | `false` | Disable TLS to upstream |
 | `AWS_BUCKET` | — | S3 bucket (required; single-tenant — same bucket for every request) |
 | `CHUNK_SIZE` | 4194304 (4 MiB) | Chunk granularity (also cache granularity) |
-| `WORKERS` | 8 | Concurrent S3 fetches per request |
+| `WORKERS` | 8 | Concurrent S3 fetches per request (chunk window, min 4) |
+| `FETCH_CONCURRENCY` | 32 | Process-wide cap on chunk buffers in memory (downloads in progress + uncached chunks awaiting consumers); heap bound = this × `CHUNK_SIZE` |
+| `CHUNK_FETCH_TIMEOUT` | `90s` | Deadline for one detached chunk fetch, including the wait for buffer budget |
+| `HEAD_CACHE_TTL` | `60s` | TTL of cached HeadObject metadata |
 | `CACHE_ENABLED` | `false` | Enable on-disk chunk cache |
 | `CACHE_DIR` | `/webtor/data*` | Cache shard roots (wildcard); piggybacks on TWS shards |
 | `CACHE_SHARD_SUBDIR` | `s3-cache` | Subdirectory inside each shard we own |
@@ -160,6 +168,14 @@ Scrape `:8083/metrics`. Key series:
 - `s3cache_upstream_bytes_fetched_total`
 - `s3cache_upstream_chunk_seconds{source="foreground|readahead"}` (histogram)
 - `s3cache_singleflight_shared_total` — fetches that joined an in-flight call
+- `s3cache_chunk_serves_total{via="hit|file|pinned|buffer"}` — chunks written
+  to clients: cache hit, miss served from the freshly written cache file,
+  miss whose file was evicted before it was opened (pinned handle), miss
+  that could not be cached (served from memory)
+- `s3cache_chunk_buffer_bytes` / `s3cache_chunk_buffer_budget_bytes` — chunk
+  bytes held in memory now / the cap (`FETCH_CONCURRENCY × CHUNK_SIZE`)
+- `s3cache_chunk_budget_waits_total` — chunk fetches that had to wait for
+  buffer budget
 - `s3cache_readahead_kicks_total{result="scheduled|dropped|already_cached"}`
 - `s3cache_eviction_runs_total`, `s3cache_eviction_bytes_freed_total`
 - `s3cache_shard_bytes{shard="..."}` — current shard size (gauge)
