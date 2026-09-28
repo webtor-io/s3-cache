@@ -93,7 +93,9 @@ same node hit the same shaper. The cache is what decouples us.
   disk its buffer is dropped and clients stream the file (sendfile), like
   a hit; slow clients cost a file handle, not 4 MiB of heap per chunk.
   Chunks that can't be cached are held in memory under a global budget of
-  `FETCH_CONCURRENCY` chunks.
+  `FETCH_CONCURRENCY` chunks; while a request holds such buffers, each
+  chunk write runs under a deadline (`CHUNK_FETCH_TIMEOUT/2`), so a client
+  that stops reading can't pin the budget and starve other misses.
 - **Singleflight dedup** — concurrent identical chunk misses collapse to
   one upstream GET. Typical for HLS where N viewers want the same
   segment simultaneously.
@@ -146,8 +148,8 @@ All settings via env vars (or matching CLI flags).
 | `AWS_BUCKET` | — | S3 bucket (required; single-tenant — same bucket for every request) |
 | `CHUNK_SIZE` | 4194304 (4 MiB) | Chunk granularity (also cache granularity) |
 | `WORKERS` | 8 | Concurrent S3 fetches per request (chunk window, min 4) |
-| `FETCH_CONCURRENCY` | 32 | Process-wide cap on chunk buffers in memory (downloads in progress + uncached chunks awaiting consumers); heap bound = this × `CHUNK_SIZE` |
-| `CHUNK_FETCH_TIMEOUT` | `90s` | Deadline for one detached chunk fetch, including the wait for buffer budget |
+| `FETCH_CONCURRENCY` | 32 | Process-wide cap on chunk buffers in memory (downloads in progress + uncached chunks awaiting consumers); live chunk bytes ≤ this × `CHUNK_SIZE` (HeapInuse runs higher until GC); must be ≥ 1 |
+| `CHUNK_FETCH_TIMEOUT` | `90s` | Deadline for one detached chunk fetch, including the wait for buffer budget; half of it bounds each chunk write while the request holds uncached buffers |
 | `HEAD_CACHE_TTL` | `60s` | TTL of cached HeadObject metadata |
 | `CACHE_ENABLED` | `false` | Enable on-disk chunk cache |
 | `CACHE_DIR` | `/webtor/data*` | Cache shard roots (wildcard); piggybacks on TWS shards |
@@ -176,6 +178,8 @@ Scrape `:8083/metrics`. Key series:
   bytes held in memory now / the cap (`FETCH_CONCURRENCY × CHUNK_SIZE`)
 - `s3cache_chunk_budget_waits_total` — chunk fetches that had to wait for
   buffer budget
+- `s3cache_stalled_writes_cut_total` — responses cut because the client did
+  not take a chunk within the write deadline while holding uncached buffers
 - `s3cache_readahead_kicks_total{result="scheduled|dropped|already_cached"}`
 - `s3cache_eviction_runs_total`, `s3cache_eviction_bytes_freed_total`
 - `s3cache_shard_bytes{shard="..."}` — current shard size (gauge)
@@ -183,6 +187,11 @@ Scrape `:8083/metrics`. Key series:
 
 Hit ratio: `rate(s3cache_cache_lookups_total{result="hit"}[5m]) /
 ignoring(result) sum(rate(s3cache_cache_lookups_total[5m]))`.
+
+Degraded mode (chunks served from memory instead of the cache): alert on
+`increase(s3cache_cache_writes_total{result="error"}[10m]) > 0` and on
+`s3cache_chunk_buffer_bytes / s3cache_chunk_buffer_budget_bytes > 0.9` for
+5 minutes.
 
 ## Deployment
 

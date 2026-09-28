@@ -62,6 +62,7 @@ go test ./services/
 | `services/fetcher.go` | `Head`, `Get`, `serveAligned` (in-order chunk dispatcher), `fetchChunk`, `lead` (detached upstream fetch + cache write), `download`, `openRange` |
 | `services/chunk.go` | `chunkFlight` (shared fetch outcome, refcounted), `chunkResult` (per-consumer handle / section / buffer), `writeSlice` |
 | `services/budget.go` | `chunkBudget` — global FIFO cap on chunk buffers in memory (`FETCH_CONCURRENCY` chunks) |
+| `services/write_guard.go` | `writeGuard` — write deadline while a request holds buffered chunks; `writeChunk` (write + flush under it) |
 | `services/cache.go` | `DiskCache.Get/Put` + sha1 shard distribution (`getDir`, `distributeByHash`) |
 | `services/eviction.go` | Bg per-shard LRU sweep (Servable) |
 | `services/readahead.go` | Best-effort sequential prefetch with bounded concurrency |
@@ -95,6 +96,7 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
         take a slot (window = workers, min 4; freed when the chunk is written)
         re-check ctx (no new work post-abort)
         go fetchChunk(absChunkIdx * chunkSize, ..., admit) → pending[idx]
+           (a buffered result is counted by the write guard before the hand-off)
         wait until that chunk is ADMITTED (hit, or its fetch holds a budget
         unit) before starting the next one
      wait for pending[0]:
@@ -103,7 +105,8 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
      for i in 1..N-1:
         select pending[i] | ctx.Done
         err → log warn, cancel, return (connection closed)
-        ok  → writeSliced + Flush, release slot
+        ok  → writeChunk: slice + Flush, under a write deadline while the
+              request holds buffered chunks (writeGuard); release slot
      readahead.Kick(bucket, key, lastChunkIdx+1, totalSize)
         │
         ▼
@@ -201,10 +204,18 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
   pinned handle through a `SectionReader` (pread; no sendfile, no heap).
 - **Global chunk-buffer budget (`FETCH_CONCURRENCY` chunks)** — every chunk
   buffer, download in progress or uncached chunk awaiting its consumer,
-  takes a unit; heap in chunk buffers ≤ `FETCH_CONCURRENCY × CHUNK_SIZE`
+  takes a unit; live chunk bytes ≤ `FETCH_CONCURRENCY × CHUNK_SIZE`
   (128 MiB at defaults) regardless of the number of clients. It replaced
   `fetchSem`, which counted downloads only. Waiters are FIFO (Go channel
-  send queue), no barging.
+  send queue), no barging. The bound is on live bytes, not on HeapInuse:
+  every chunk gets a fresh buffer that only the GC frees, so HeapInuse
+  runs 2–4× the budget under churn (review stand, 70 slow clients: 241 MiB
+  HeapInuse at 124 MiB of buffers, 33 MiB really live at 200 clients). A
+  free list would pin the budget permanently and let a reuse bug serve
+  another chunk's bytes; not done while GC cost isn't shown to matter.
+  `FETCH_CONCURRENCY < 1` (and `CHUNK_FETCH_TIMEOUT <= 0`, `CHUNK_SIZE < 1`)
+  is refused at startup: at 0 every miss used to wait out the fetch
+  timeout and 502.
 - **Budget admission in chunk order per request** — the dispatcher starts
   chunk i+1 only once chunk i is admitted. Otherwise later chunks of a
   request can hold the whole budget (buffers only its own consumer
@@ -212,14 +223,36 @@ GET /{key}  Range: bytes=start-end | bytes=start- | bytes=-N (suffix)
   2-chunk budget and 24 requests that deadlocked every request until the
   fetch timeout (24 × 502). With the ordering, whoever holds budget has
   every earlier chunk in hand or in progress, so its consumer advances.
-- **Trade-off of the budget when chunks can't be cached** (cache disabled,
-  `Put` failing, e.g. a full disk): buffers wait for their consumers, so
-  clients that stop reading (paused players behind thp) hold units — up to
-  the window (8) each; 4 stalled clients take the default budget and other
-  misses queue (FIFO) until someone reads or `CHUNK_FETCH_TIMEOUT` → 502.
-  Hits and cached misses are unaffected. Before, the same situation grew
-  the heap without bound. Watch `s3cache_chunk_serves_total{via="buffer"}`
-  and `s3cache_chunk_budget_waits_total`.
+- **Write deadline while a request holds buffered chunks (`writeGuard`)**
+  — when chunks can't be cached (cache disabled, `Put` failing, e.g. a full
+  shard) buffers wait for their consumers, so a client that stops reading
+  (a paused player behind thp) pins a unit per buffered chunk in its window
+  (up to 8); 4 such clients took the default budget and every other miss on
+  the node queued until `CHUNK_FETCH_TIMEOUT` → 502 (reproduced by both
+  reviews of 09cfaa9). The consumer can be stuck on a buffered chunk or on
+  a cached one with buffered chunks behind it (cached start of an object,
+  the rest refused by a full shard), so the deadline follows the buffers
+  the request holds, not the kind of chunk being written: while any are
+  held, each chunk write + flush gets `CHUNK_FETCH_TIMEOUT/2` (45 s) — armed
+  at write start, or when a buffered chunk arrives mid-write — and it is
+  cleared after every chunk (no server `WriteTimeout` resets it on
+  keep-alive). Half the fetch timeout so a fetch queued behind a stalled
+  holder still gets a unit with time to download. Cost: while holding
+  buffers, clients slower than `CHUNK_SIZE`/45 s (~0.75 Mbit/s) are cut and
+  reconnect with Range. Requests holding no buffers (hits, cached misses —
+  the normal mode) are never cut. Cuts: `s3cache_stalled_writes_cut_total`.
+  Degraded mode worth an alert: `s3cache_cache_writes_total{result="error"}`
+  growing, `s3cache_chunk_buffer_bytes / s3cache_chunk_buffer_budget_bytes`
+  near 1.
+- **Slow-client memory moved from the heap to the page cache** — serving
+  misses from the file makes the per-client cost clients × window × chunk
+  of file pages (2.2 GiB for 70 clients), charged to the pod's cgroup and
+  reclaimable; when it doesn't fit, sendfile re-reads from disk (review
+  stand: fine at 70 clients, system CPU and probe latency up at 200 on a
+  4 GiB VM). Hence the 4Gi limit and 5 s probe timeout stay. Files the
+  evictor unlinks while clients still read them are invisible to its size
+  accounting, so a shard can exceed `EVICTION_MAX_BYTES` by the same amount
+  until those clients finish.
 - **Slot window = `workers` (min 4)** — caps how far fetches run ahead of
   the consumer (file handles, and buffers when uncached) per request.
 - **Per-shard size cap, not global** — one hot key family can't starve
@@ -244,7 +277,7 @@ Common-services wiring:
 
 Local tunables:
 
-- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8), `AWS_BUCKET` (required — bucket is fixed per deploy), `FETCH_CONCURRENCY` (32, process-wide cap on chunk buffers in memory — downloads in progress plus uncached chunks awaiting consumers; heap bound = this × `CHUNK_SIZE`), `CHUNK_FETCH_TIMEOUT` (90s, detached fetch deadline), `HEAD_CACHE_TTL` (60s)
+- Fetcher: `CHUNK_SIZE` (4 MiB), `WORKERS` (8), `AWS_BUCKET` (required — bucket is fixed per deploy), `FETCH_CONCURRENCY` (32, process-wide cap on chunk buffers in memory — downloads in progress plus uncached chunks awaiting consumers; live chunk bytes ≤ this × `CHUNK_SIZE`; at least 1), `CHUNK_FETCH_TIMEOUT` (90s, detached fetch deadline; half of it is the write deadline while a request holds buffered chunks), `HEAD_CACHE_TTL` (60s)
 - Cache: `CACHE_ENABLED` (off by default — chart enables), `CACHE_DIR` (`/webtor/data*` — reuses TWS shard topology), `CACHE_SHARD_SUBDIR` (`s3-cache`)
 - Eviction: `EVICTION_MAX_BYTES` (10 GiB / shard), `EVICTION_INTERVAL` (1m)
 - Readahead: `READAHEAD_CHUNKS` (4), `READAHEAD_CONCURRENCY` (8), `READAHEAD_TIMEOUT` (30s)
