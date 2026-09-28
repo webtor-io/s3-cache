@@ -60,6 +60,26 @@ var (
 		Help: "Bytes deleted by the evictor.",
 	})
 
+	chunkBufferBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "s3cache_chunk_buffer_bytes",
+		Help: "Chunk bytes held in memory: upstream downloads in progress plus uncached chunks awaiting their consumers.",
+	})
+
+	chunkBufferBudgetBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "s3cache_chunk_buffer_budget_bytes",
+		Help: "Cap on s3cache_chunk_buffer_bytes (FETCH_CONCURRENCY x CHUNK_SIZE).",
+	})
+
+	chunkBudgetWaits = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "s3cache_chunk_budget_waits_total",
+		Help: "Chunk fetches that had to wait for buffer budget.",
+	})
+
+	chunkServes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "s3cache_chunk_serves_total",
+		Help: "Chunks written to clients, by where the bytes came from.",
+	}, []string{"via"}) // hit | file | pinned | buffer
+
 	cacheSize = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "s3cache_shard_bytes",
 		Help: "Current cache size per shard (as observed by the last eviction sweep).",

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -54,7 +54,7 @@ func RegisterFetcherFlags(f []cli.Flag) []cli.Flag {
 		},
 		cli.IntFlag{
 			Name:   FetchConcurrencyFlag,
-			Usage:  "process-wide cap on concurrent upstream chunk fetches (bounds detached-fetch buildup under abort storms)",
+			Usage:  "process-wide cap on chunk buffers in memory: upstream fetches in progress plus uncached chunks awaiting slow consumers (heap bound = this x chunk-size)",
 			Value:  32,
 			EnvVar: "FETCH_CONCURRENCY",
 		},
@@ -81,9 +81,12 @@ type Fetcher struct {
 	cache             *DiskCache
 	sf                *singleflight
 	readahead         *Readahead
-	fetchSem          chan struct{}
+	budget            *chunkBudget
 	chunkFetchTimeout time.Duration
 	heads             *headCache
+
+	flights  atomic.Int64      // published flights not yet released (leak checks in tests)
+	afterPut func(path string) // test hook: runs between the cache write and the callers' opens
 }
 
 func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *Readahead) *Fetcher {
@@ -91,15 +94,16 @@ func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *
 	if bucket == "" {
 		log.Fatal("AWS_BUCKET is required")
 	}
+	chunkSize := c.Int64(ChunkSizeFlag)
 	return &Fetcher{
 		s3cl:              s3cl,
 		bucket:            bucket,
-		chunkSize:         c.Int64(ChunkSizeFlag),
+		chunkSize:         chunkSize,
 		workers:           c.Int(WorkersFlag),
 		cache:             cache,
 		sf:                newSingleflight(),
 		readahead:         readahead,
-		fetchSem:          make(chan struct{}, c.Int(FetchConcurrencyFlag)),
+		budget:            newChunkBudget(c.Int(FetchConcurrencyFlag), chunkSize),
 		chunkFetchTimeout: c.Duration(ChunkFetchTimeoutFlag),
 		heads:             newHeadCache(c.Duration(HeadCacheTTLFlag)),
 	}
@@ -240,72 +244,80 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	lastChunkIdx := end / chunkSize
 	nChunks := int(lastChunkIdx - firstChunkIdx + 1)
 
-	workers := f.workers
-	if workers > nChunks {
-		workers = nChunks
-	}
-
 	pending := make([]chan chunkResult, nChunks)
 	for i := range pending {
 		pending[i] = make(chan chunkResult, 1)
 	}
 
-	jobs := make(chan int, nChunks)
-	for i := 0; i < nChunks; i++ {
-		jobs <- i
+	// Slot semaphore caps how far fetches can run ahead of the consumer
+	// (and thereby the open file handles / buffer references one request
+	// holds). A slot is taken per chunk in order and freed once the
+	// consumer has written that chunk.
+	window := f.workers
+	if window < 4 {
+		window = 4
 	}
-	close(jobs)
-
-	// Slot semaphore caps how far workers can race ahead of the
-	// consumer. Without it 250 chunks of a 1 GiB file could all
-	// materialize in RAM before the client drains. Cap = workers
-	// (one in-flight chunk per worker) — under slow-client load this
-	// halves the transient working set vs the old workers*2 default
-	// without measurably hurting throughput, since workers re-fill
-	// the moment the consumer drains.
-	slotCap := workers
-	if slotCap < 4 {
-		slotCap = 4
-	}
-	slots := make(chan struct{}, slotCap)
+	slots := make(chan struct{}, window)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// The dispatcher starts chunk fetches strictly in order and admits
+	// chunk i+1 only once chunk i no longer waits for buffer budget (cache
+	// hit, or its fetch holds a unit). Without the ordering a request could
+	// hold budget for later chunks — buffers only its own consumer
+	// releases — while its head chunk queues for budget; enough such
+	// requests exhaust the budget and every one of them stalls until the
+	// fetch timeout. With it, a request that holds budget for chunk j has
+	// every earlier chunk in hand or in progress, so its consumer always
+	// advances and eventually returns the budget.
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
-				select {
-				case slots <- struct{}{}:
-				case <-ctx.Done():
-					pending[idx] <- chunkResult{err: ctx.Err()}
-					return
-				}
-				// The select above picks pseudo-randomly when both cases are
-				// ready (cleanupPending refills slots after cancel) — don't
-				// start new upstream work for a request that's already gone.
-				if ctx.Err() != nil {
-					pending[idx] <- chunkResult{err: ctx.Err()}
-					return
-				}
-				absChunkIdx := firstChunkIdx + int64(idx)
-				cStart := absChunkIdx * chunkSize
-				cEnd := cStart + chunkSize - 1
-				if totalSize > 0 && cEnd > totalSize-1 {
-					cEnd = totalSize - 1
-				}
-				cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceForeground)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for idx := 0; idx < nChunks; idx++ {
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			// The select picks pseudo-randomly when both cases are ready —
+			// don't start new work for a request that's already gone.
+			if ctx.Err() != nil {
+				return
+			}
+			absChunkIdx := firstChunkIdx + int64(idx)
+			cStart := absChunkIdx * chunkSize
+			cEnd := cStart + chunkSize - 1
+			if totalSize > 0 && cEnd > totalSize-1 {
+				cEnd = totalSize - 1
+			}
+			admitted := make(chan struct{})
+			var once sync.Once
+			admit := func() { once.Do(func() { close(admitted) }) }
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				defer admit()
+				cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceForeground, admit)
 				if err != nil {
-					pending[idx] <- chunkResult{err: err, chunkStart: cStart}
-					continue
+					cr = chunkResult{err: err}
 				}
 				cr.chunkStart = cStart
 				pending[idx] <- cr
+			}(idx)
+			select {
+			case <-admitted:
+			case <-ctx.Done():
+				return
 			}
-		}()
+		}
+	}()
+
+	abort := func() {
+		cancel()
+		wg.Wait()
+		cleanupPending(pending)
 	}
 
 	// Wait for chunk 0 before committing status — earlier failure surfaces
@@ -314,19 +326,13 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	select {
 	case res0 = <-pending[0]:
 	case <-ctx.Done():
-		cancel()
-		cleanupPending(slots, pending)
-		wg.Wait()
-		cleanupPending(slots, pending)
+		abort()
 		dropValidatorHeaders(w)
 		http.Error(w, "request cancelled", http.StatusBadGateway)
 		return ctx.Err()
 	}
 	if res0.err != nil {
-		cancel()
-		cleanupPending(slots, pending)
-		wg.Wait()
-		cleanupPending(slots, pending)
+		abort()
 		dropValidatorHeaders(w)
 		httpErrorFromS3(w, res0.err)
 		return res0.err
@@ -342,15 +348,14 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	w.WriteHeader(status)
 	flusher, _ := w.(http.Flusher)
 
-	if _, err := res0.writeSlice(w, start, end); err != nil {
-		res0.close()
-		cancel()
-		cleanupPending(slots, pending)
-		wg.Wait()
-		cleanupPending(slots, pending)
+	_, err := res0.writeSlice(w, start, end)
+	via := res0.via
+	res0.close()
+	if err != nil {
+		abort()
 		return err
 	}
-	res0.close()
+	chunkServes.WithLabelValues(via).Inc()
 	<-slots
 	if flusher != nil {
 		flusher.Flush()
@@ -363,30 +368,23 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 				log.WithFields(log.Fields{
 					"key": key, "chunk": i,
 				}).WithError(res.err).Warn("chunk failed mid-response")
-				cancel()
-				cleanupPending(slots, pending)
-				wg.Wait()
-				cleanupPending(slots, pending)
+				abort()
 				return res.err
 			}
-			if _, err := res.writeSlice(w, start, end); err != nil {
-				res.close()
-				cancel()
-				cleanupPending(slots, pending)
-				wg.Wait()
-				cleanupPending(slots, pending)
+			_, err := res.writeSlice(w, start, end)
+			via := res.via
+			res.close()
+			if err != nil {
+				abort()
 				return err
 			}
-			res.close()
+			chunkServes.WithLabelValues(via).Inc()
 			<-slots
 			if flusher != nil {
 				flusher.Flush()
 			}
 		case <-ctx.Done():
-			cancel()
-			cleanupPending(slots, pending)
-			wg.Wait()
-			cleanupPending(slots, pending)
+			abort()
 			return ctx.Err()
 		}
 	}
@@ -400,96 +398,21 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	return nil
 }
 
-// chunkResult is the worker→consumer payload. Exactly one of {data, file}
-// is set on success: a cache hit returns the open *os.File so the
-// consumer can stream slices via io.CopyN (no 4 MiB heap alloc per
-// hit); a cache miss returns the freshly-fetched bytes (which already
-// got cached to disk by fetchUncached).
-//
-// The consumer MUST call close() on every chunkResult it reads, even
-// (especially) on error paths — otherwise the file handle leaks.
-type chunkResult struct {
-	data       []byte
-	file       *os.File
-	fileSize   int64
-	err        error
-	chunkStart int64
-}
-
-func (cr *chunkResult) size() int64 {
-	if cr.file != nil {
-		return cr.fileSize
-	}
-	return int64(len(cr.data))
-}
-
-func (cr *chunkResult) close() {
-	if cr.file != nil {
-		_ = cr.file.Close()
-		cr.file = nil
-	}
-}
-
-// writeSlice writes the portion of the chunk that falls inside
-// [reqStart..reqEnd]. From the hit path it Seeks + io.CopyN'es out
-// of the open file; from the miss path it w.Write's the in-memory
-// slice.
-func (cr *chunkResult) writeSlice(w io.Writer, reqStart, reqEnd int64) (int64, error) {
-	chunkStart := cr.chunkStart
-	chunkEnd := chunkStart + cr.size() - 1
-	sliceStart := int64(0)
-	if reqStart > chunkStart {
-		sliceStart = reqStart - chunkStart
-	}
-	sliceEnd := cr.size()
-	if reqEnd < chunkEnd {
-		sliceEnd = reqEnd - chunkStart + 1
-	}
-	if sliceStart >= sliceEnd {
-		return 0, nil
-	}
-	if cr.file != nil {
-		if _, err := cr.file.Seek(sliceStart, io.SeekStart); err != nil {
-			return 0, err
-		}
-		return io.CopyN(w, cr.file, sliceEnd-sliceStart)
-	}
-	n, err := w.Write(cr.data[sliceStart:sliceEnd])
-	return int64(n), err
-}
-
-// cleanupPending drains the slot semaphore (so blocked workers can
-// proceed and exit) and closes any chunkResult left in the per-chunk
-// channels — necessary because hit results carry an open *os.File.
-// Safe to call multiple times.
-func cleanupPending(slots chan struct{}, pending []chan chunkResult) {
-	for {
-		select {
-		case <-slots:
-		default:
-			goto pendingDrain
-		}
-	}
-pendingDrain:
-	for i := range pending {
-		select {
-		case cr := <-pending[i]:
-			cr.close()
-		default:
-		}
-	}
-}
-
 // fetchChunk pulls a single aligned chunk: cache lookup → singleflight →
 // upstream + cache write. `source` labels metrics for foreground vs
-// readahead traffic. On a hit, the returned chunkResult carries an open
-// *os.File; on a miss, it carries the freshly-fetched bytes. Callers
-// MUST chunkResult.close() in either case.
+// readahead traffic. Callers MUST chunkResult.close() the result.
+//
+// admit (may be nil) is called exactly once, as soon as this chunk no
+// longer waits for buffer budget: on a cache hit, when the fetch it
+// leads or joined holds a budget unit, or on any early return.
 //
 // start MUST be chunkSize-aligned; end is start+chunkSize-1 unless this
 // is the last chunk in the object (EOF-clamped). The cache key is keyed
 // on start only — the same aligned offset always means the same chunk.
-func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, source string) (chunkResult, error) {
+func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, source string, admit func()) (chunkResult, error) {
+	if admit == nil {
+		admit = func() {}
+	}
 	if file, size, err := f.cache.Get(key, start); err != nil {
 		cacheLookups.WithLabelValues("error").Inc()
 		log.WithError(err).WithFields(log.Fields{
@@ -498,12 +421,14 @@ func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, 
 	} else if file != nil {
 		cacheLookups.WithLabelValues("hit").Inc()
 		cacheBytesServed.Add(float64(size))
-		return chunkResult{file: file, fileSize: size, chunkStart: start}, nil
+		admit()
+		return chunkResult{file: file, fileSize: size, chunkStart: start, via: viaHit}, nil
 	} else {
 		cacheLookups.WithLabelValues("miss").Inc()
 	}
 
 	if ctx.Err() != nil {
+		admit()
 		return chunkResult{}, ctx.Err()
 	}
 
@@ -514,41 +439,109 @@ func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, 
 	// loops until the player gives up (the 2026-07 credits-drop storms).
 	// The WAIT below stays cancellable though: an aborted caller returns
 	// immediately while the fetch finishes in the background (bounded by
-	// fetchSem + chunkFetchTimeout) and warms the cache for the next retry.
+	// the buffer budget + chunkFetchTimeout) and warms the cache for the
+	// next retry.
 	sfKey := fmt.Sprintf("%s/%d", key, start)
-	type sfOut struct {
-		data   []byte
-		err    error
-		shared bool
+	c, leader := f.sf.join(sfKey)
+	if leader {
+		go f.lead(sfKey, key, start, end, source, c)
+	} else {
+		singleflightShared.Inc()
 	}
-	done := make(chan sfOut, 1)
+
+	// Claim the result in a goroutine that outlives an aborted caller: the
+	// flight counted this caller, so its reference must be dropped whether
+	// or not anyone is left to read the chunk. The handoff is unbuffered —
+	// either the caller receives the result (and owns closing it), or the
+	// caller is gone and the result is closed here.
+	out := make(chan chunkResult)
 	go func() {
-		data, err, shared := f.sf.Do(sfKey, func() ([]byte, error) {
-			dctx, cancel := context.WithTimeout(context.Background(), f.chunkFetchTimeout)
-			defer cancel()
-			select {
-			case f.fetchSem <- struct{}{}:
-			case <-dctx.Done():
-				return nil, errors.New("chunk fetch queue timeout")
-			}
-			defer func() { <-f.fetchSem }()
-			return f.fetchUncached(dctx, key, start, end, source)
-		})
-		done <- sfOut{data: data, err: err, shared: shared}
+		<-c.done
+		cr := c.res.claim(start)
+		select {
+		case out <- cr:
+		case <-ctx.Done():
+			cr.close()
+		}
 	}()
 
 	select {
-	case out := <-done:
-		if out.shared {
-			singleflightShared.Inc()
-		}
-		if out.err != nil {
-			return chunkResult{}, out.err
-		}
-		return chunkResult{data: out.data, chunkStart: start}, nil
+	case <-c.admitted:
+		admit()
+	case <-ctx.Done():
+		admit()
+		return chunkResult{}, ctx.Err()
+	}
+	select {
+	case cr := <-out:
+		return cr, cr.err
 	case <-ctx.Done():
 		return chunkResult{}, ctx.Err()
 	}
+}
+
+// lead runs the upstream fetch for one singleflight call, detached from
+// every caller's context (see fetchChunk). It always finishes the call, so
+// every caller has a result to claim.
+func (f *Fetcher) lead(sfKey, key string, start, end int64, source string, c *sfCall) {
+	dctx, cancel := context.WithTimeout(context.Background(), f.chunkFetchTimeout)
+	defer cancel()
+
+	size := end - start + 1
+	res := &chunkFlight{size: size}
+	f.flights.Add(1)
+	res.free = func() {
+		if res.pin != nil {
+			_ = res.pin.Close()
+		}
+		if res.buf != nil {
+			f.budget.release(size)
+		}
+		f.flights.Add(-1)
+	}
+
+	if err := f.budget.acquire(dctx); err != nil {
+		res.err = errors.New("chunk fetch queue timeout")
+		f.sf.finish(sfKey, c, res)
+		return
+	}
+	c.admit()
+
+	buf := f.budget.alloc(size)
+	if err := f.download(dctx, key, start, end, source, buf); err != nil {
+		f.budget.release(size)
+		res.err = err
+		f.sf.finish(sfKey, c, res)
+		return
+	}
+
+	// Cache failures are logged but don't fail the request — a degraded
+	// cache is still better than no response.
+	pin, path, err := f.cache.Put(key, start, buf)
+	if err != nil {
+		cacheWrites.WithLabelValues("error").Inc()
+		log.WithError(err).WithFields(log.Fields{
+			"key": key, "chunk_start": start,
+		}).Warn("cache put failed")
+	} else if pin != nil {
+		cacheWrites.WithLabelValues("ok").Inc()
+	}
+	if pin != nil {
+		// Cached: every caller reads the file, the buffer goes now. Holding
+		// it until slow consumers drained it was the 2026-09-28 heap blowup
+		// (~70 slow downloads × up to 8 chunks each, no global cap).
+		f.budget.release(size)
+		res.path, res.pin = path, pin
+		if f.afterPut != nil {
+			f.afterPut(path)
+		}
+	} else {
+		// Not cached (cache disabled or Put failed): callers share the
+		// buffer, and its budget unit stays taken until the last one is
+		// done with it.
+		res.buf = buf
+	}
+	f.sf.finish(sfKey, c, res)
 }
 
 // dropValidatorHeaders strips ETag/Last-Modified before an error status is
@@ -559,18 +552,15 @@ func dropValidatorHeaders(w http.ResponseWriter) {
 	w.Header().Del("Last-Modified")
 }
 
-// fetchUncached pulls bytes from S3 and writes them to cache. Cache
-// failures are logged but don't fail the request — a degraded cache is
-// still better than no response.
-func (f *Fetcher) fetchUncached(ctx context.Context, key string, start, end int64, source string) ([]byte, error) {
+// download fills buf with bytes [start..end] of key from S3.
+func (f *Fetcher) download(ctx context.Context, key string, start, end int64, source string, buf []byte) error {
 	t0 := time.Now()
 	body, _, _, err := f.openRange(ctx, key, start, end)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer body.Close()
 
-	buf := make([]byte, end-start+1)
 	n, err := io.ReadFull(body, buf)
 	if err != nil {
 		// A short read is an upstream failure, never a valid chunk — the
@@ -579,23 +569,13 @@ func (f *Fetcher) fetchUncached(ctx context.Context, key string, start, end int6
 		// cached chunk poisons every response over this offset until
 		// eviction).
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
-		return nil, errors.Wrapf(err, "read chunk body: got %d of %d bytes", n, len(buf))
+		return errors.Wrapf(err, "read chunk body: got %d of %d bytes", n, len(buf))
 	}
-	data := buf
 	upstreamChunkDuration.WithLabelValues(source).Observe(time.Since(t0).Seconds())
 	upstreamBytesFetched.Add(float64(n))
-
-	if err := f.cache.Put(key, start, data); err != nil {
-		cacheWrites.WithLabelValues("error").Inc()
-		log.WithError(err).WithFields(log.Fields{
-			"key": key, "chunk_start": start,
-		}).Warn("cache put failed")
-	} else if f.cache != nil {
-		cacheWrites.WithLabelValues("ok").Inc()
-	}
-	return data, nil
+	return nil
 }
 
 // openRange opens a single Range GET against S3. Returns body +

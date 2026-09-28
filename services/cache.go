@@ -140,39 +140,41 @@ func (c *DiskCache) Get(key string, alignedOffset int64) (*os.File, int64, error
 	return f, info.Size(), nil
 }
 
-// Put writes data to <path> via tmp+rename. Idempotent — concurrent Puts
-// for the same key race on the rename and the loser silently overwrites.
-func (c *DiskCache) Put(key string, alignedOffset int64, data []byte) error {
+// Put writes data to the chunk's path via tmp+rename and returns an open
+// handle on the written file plus its path. The handle pins the inode: if
+// the evictor unlinks the path right after the rename, the bytes stay
+// readable through it until it is closed. The caller MUST close it.
+// Returns (nil, "", nil) on a nil (disabled) cache. Idempotent —
+// concurrent Puts for the same key race on the rename and the loser
+// silently overwrites (same bytes: chunks are immutable).
+func (c *DiskCache) Put(key string, alignedOffset int64, data []byte) (*os.File, string, error) {
 	if c == nil {
-		return nil
+		return nil, "", nil
 	}
 	p, err := c.path(key, alignedOffset)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return nil, "", err
 	}
 	tmp, err := os.CreateTemp(dir, ".tmp_chunk_*")
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
+		return nil, "", err
 	}
 	if err := os.Rename(tmpName, p); err != nil {
+		tmp.Close()
 		os.Remove(tmpName)
-		return err
+		return nil, "", err
 	}
-	return nil
+	return tmp, p, nil
 }
 
 // getDir resolves a shard for a hash under a wildcard location like /cache/*.

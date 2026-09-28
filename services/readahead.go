@@ -133,7 +133,7 @@ func (r *Readahead) schedule(f *Fetcher, key string, chunkIdx, totalSize int64) 
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 		defer cancel()
-		cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceReadahead)
+		cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceReadahead, nil)
 		// Readahead only cares about populating the cache as a
 		// side effect; the chunkResult itself is discarded. Close
 		// any open file handle (the hit branch) so we don't leak fds.
