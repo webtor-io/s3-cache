@@ -54,7 +54,7 @@ func RegisterFetcherFlags(f []cli.Flag) []cli.Flag {
 		},
 		cli.IntFlag{
 			Name:   FetchConcurrencyFlag,
-			Usage:  "process-wide cap on chunk buffers in memory: upstream fetches in progress plus uncached chunks awaiting slow consumers (heap bound = this x chunk-size)",
+			Usage:  "process-wide cap on chunk buffers in memory: upstream fetches in progress plus uncached chunks awaiting slow consumers (live chunk bytes <= this x chunk-size; at least 1)",
 			Value:  32,
 			EnvVar: "FETCH_CONCURRENCY",
 		},
@@ -100,6 +100,9 @@ func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *
 		log.Fatal("AWS_BUCKET is required")
 	}
 	chunkSize := c.Int64(ChunkSizeFlag)
+	if err := validateFetcherConfig(chunkSize, c.Int(FetchConcurrencyFlag), c.Duration(ChunkFetchTimeoutFlag)); err != nil {
+		log.Fatal(err)
+	}
 	return &Fetcher{
 		s3cl:              s3cl,
 		bucket:            bucket,
@@ -113,6 +116,24 @@ func NewFetcher(c *cli.Context, s3cl *cs.S3Client, cache *DiskCache, readahead *
 		writeGuardTimeout: c.Duration(ChunkFetchTimeoutFlag) / 2,
 		heads:             newHeadCache(c.Duration(HeadCacheTTLFlag)),
 	}
+}
+
+// validateFetcherConfig rejects settings under which no cache miss can be
+// served, instead of failing at run time: FETCH_CONCURRENCY 0 made the
+// buffer budget an unbuffered channel, so every miss waited out
+// CHUNK_FETCH_TIMEOUT and got a 502 (a negative one panicked in make); a
+// non-positive CHUNK_FETCH_TIMEOUT expires every fetch at once (and turns
+// the write guard off); CHUNK_SIZE 0 divides by zero on every GET.
+func validateFetcherConfig(chunkSize int64, fetchConcurrency int, chunkFetchTimeout time.Duration) error {
+	switch {
+	case chunkSize < 1:
+		return errors.Errorf("CHUNK_SIZE must be positive, got %d", chunkSize)
+	case fetchConcurrency < 1:
+		return errors.Errorf("FETCH_CONCURRENCY must be at least 1, got %d: it is the number of chunk buffers allowed in memory, and with none every cache miss fails", fetchConcurrency)
+	case chunkFetchTimeout <= 0:
+		return errors.Errorf("CHUNK_FETCH_TIMEOUT must be positive, got %v", chunkFetchTimeout)
+	}
+	return nil
 }
 
 // headObject returns object metadata through a TTL cache. Objects are
