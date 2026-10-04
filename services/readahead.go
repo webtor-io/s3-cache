@@ -72,7 +72,7 @@ func NewReadahead(c *cli.Context) *Readahead {
 // Kick schedules readahead for `chunks` aligned chunks starting at
 // fromChunkIdx. totalSize must be known (>0); without it we don't know
 // where the file ends.
-func (r *Readahead) Kick(f *Fetcher, key string, fromChunkIdx, totalSize int64) {
+func (r *Readahead) Kick(f *Fetcher, key string, v objVersion, fromChunkIdx, totalSize int64) {
 	if r == nil || r.chunks == 0 || totalSize <= 0 {
 		return
 	}
@@ -83,11 +83,11 @@ func (r *Readahead) Kick(f *Fetcher, key string, fromChunkIdx, totalSize int64) 
 		if c > lastChunkIdx {
 			return
 		}
-		r.schedule(f, key, c, totalSize)
+		r.schedule(f, key, v, c, totalSize)
 	}
 }
 
-func (r *Readahead) schedule(f *Fetcher, key string, chunkIdx, totalSize int64) {
+func (r *Readahead) schedule(f *Fetcher, key string, v objVersion, chunkIdx, totalSize int64) {
 	chunkSize := f.chunkSize
 	cStart := chunkIdx * chunkSize
 	cEnd := cStart + chunkSize - 1
@@ -95,13 +95,13 @@ func (r *Readahead) schedule(f *Fetcher, key string, chunkIdx, totalSize int64) 
 		cEnd = totalSize - 1
 	}
 
-	if file, _, _ := f.cache.Get(key, cStart); file != nil {
+	if file, _, _ := f.cache.Get(key, v, cStart); file != nil {
 		file.Close()
 		readaheadKicks.WithLabelValues("already_cached").Inc()
 		return
 	}
 
-	dedupKey := key + "/" + itoa(cStart)
+	dedupKey := key + "/" + itoa(cStart) + "/" + v.etag
 	r.mu.Lock()
 	if _, ok := r.inflight[dedupKey]; ok {
 		r.mu.Unlock()
@@ -133,7 +133,7 @@ func (r *Readahead) schedule(f *Fetcher, key string, chunkIdx, totalSize int64) 
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 		defer cancel()
-		cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceReadahead, nil)
+		cr, err := f.fetchChunk(ctx, key, v, cStart, cEnd, sourceReadahead, nil)
 		// Readahead only cares about populating the cache as a
 		// side effect; the chunkResult itself is discarded. Close
 		// any open file handle (the hit branch) so we don't leak fds.

@@ -136,9 +136,11 @@ func validateFetcherConfig(chunkSize int64, fetchConcurrency int, chunkFetchTime
 	return nil
 }
 
-// headObject returns object metadata through a TTL cache. Objects are
-// content-addressed and immutable, so a fresh entry short-circuits the
-// upstream HEAD every GET would otherwise pay. When the upstream HEAD
+// headObject returns object metadata through a TTL cache, so a fresh entry
+// short-circuits the upstream HEAD every GET would otherwise pay. Keys are
+// not immutable (vault re-uploads a corrupt file under the same key): the
+// ETag it returns versions the cached chunks, so a re-upload is served
+// within one TTL. When the upstream HEAD
 // fails and a stale entry exists, the stale entry is served instead —
 // fully-disk-cached content must stay servable through upstream outages
 // (the cache exists to decouple serving from the upstream).
@@ -254,7 +256,8 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, st
 		return nil
 	}
 
-	return f.serveAligned(ctx, w, key, start, end, totalSize, rangeRequested)
+	v := objVersion{etag: aws.StringValue(hd.ETag), modified: aws.TimeValue(hd.LastModified)}
+	return f.serveAligned(ctx, w, key, v, start, end, totalSize, rangeRequested)
 }
 
 // serveAligned splits [start..end] into chunkSize-aligned chunks
@@ -265,7 +268,7 @@ func (f *Fetcher) Get(ctx context.Context, w http.ResponseWriter, key string, st
 // Status commit is deferred until chunk 0 resolves: a pre-header
 // upstream failure yields a clean 502; failures on later chunks can
 // only abort an already-streaming response.
-func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key string, start, end, totalSize int64, rangeRequested bool) error {
+func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key string, v objVersion, start, end, totalSize int64, rangeRequested bool) error {
 	chunkSize := f.chunkSize
 	firstChunkIdx := start / chunkSize
 	lastChunkIdx := end / chunkSize
@@ -328,7 +331,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 			go func(idx int) {
 				defer wg.Done()
 				defer admit()
-				cr, err := f.fetchChunk(ctx, key, cStart, cEnd, sourceForeground, admit)
+				cr, err := f.fetchChunk(ctx, key, v, cStart, cEnd, sourceForeground, admit)
 				if err != nil {
 					cr = chunkResult{err: err}
 				}
@@ -420,7 +423,7 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 	// Sequential readahead kicks past the served tail. Fire-and-forget;
 	// schedule() handles dedup / saturation / cache-already-hit.
 	if f.readahead != nil {
-		f.readahead.Kick(f, key, lastChunkIdx+1, totalSize)
+		f.readahead.Kick(f, key, v, lastChunkIdx+1, totalSize)
 	}
 	return nil
 }
@@ -434,13 +437,14 @@ func (f *Fetcher) serveAligned(ctx context.Context, w http.ResponseWriter, key s
 // leads or joined holds a budget unit, or on any early return.
 //
 // start MUST be chunkSize-aligned; end is start+chunkSize-1 unless this
-// is the last chunk in the object (EOF-clamped). The cache key is keyed
-// on start only — the same aligned offset always means the same chunk.
-func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, source string, admit func()) (chunkResult, error) {
+// is the last chunk in the object (EOF-clamped). A chunk is keyed by the
+// aligned start and the object version: the same offset of the same
+// version always means the same bytes.
+func (f *Fetcher) fetchChunk(ctx context.Context, key string, v objVersion, start, end int64, source string, admit func()) (chunkResult, error) {
 	if admit == nil {
 		admit = func() {}
 	}
-	if file, size, err := f.cache.Get(key, start); err != nil {
+	if file, size, err := f.cache.Get(key, v, start); err != nil {
 		cacheLookups.WithLabelValues("error").Inc()
 		log.WithError(err).WithFields(log.Fields{
 			"key": key, "chunk_start": start,
@@ -468,10 +472,12 @@ func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, 
 	// immediately while the fetch finishes in the background (bounded by
 	// the buffer budget + chunkFetchTimeout) and warms the cache for the
 	// next retry.
-	sfKey := fmt.Sprintf("%s/%d", key, start)
+	// The version is part of the flight: a request for re-uploaded bytes
+	// must not join a fetch that started on the old ones.
+	sfKey := fmt.Sprintf("%s/%d/%s", key, start, v.etag)
 	c, leader := f.sf.join(sfKey)
 	if leader {
-		go f.lead(sfKey, key, start, end, source, c)
+		go f.lead(sfKey, key, v, start, end, source, c)
 	} else {
 		singleflightShared.Inc()
 	}
@@ -510,7 +516,7 @@ func (f *Fetcher) fetchChunk(ctx context.Context, key string, start, end int64, 
 // lead runs the upstream fetch for one singleflight call, detached from
 // every caller's context (see fetchChunk). It always finishes the call, so
 // every caller has a result to claim.
-func (f *Fetcher) lead(sfKey, key string, start, end int64, source string, c *sfCall) {
+func (f *Fetcher) lead(sfKey, key string, v objVersion, start, end int64, source string, c *sfCall) {
 	dctx, cancel := context.WithTimeout(context.Background(), f.chunkFetchTimeout)
 	defer cancel()
 
@@ -544,7 +550,7 @@ func (f *Fetcher) lead(sfKey, key string, start, end int64, source string, c *sf
 
 	// Cache failures are logged but don't fail the request — a degraded
 	// cache is still better than no response.
-	pin, path, err := f.cache.Put(key, start, buf)
+	pin, path, err := f.cache.Put(key, v, start, buf)
 	if err != nil {
 		cacheWrites.WithLabelValues("error").Inc()
 		log.WithError(err).WithFields(log.Fields{

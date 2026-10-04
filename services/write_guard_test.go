@@ -16,7 +16,7 @@ import (
 // are read-only too).
 func (e *testEnv) seedChunk(key string, off, size int64) {
 	e.t.Helper()
-	p, err := e.f.cache.path(key, off)
+	p, err := e.f.cache.path(key, objVersion{}, off) // a chunk cached before versioning
 	if err != nil {
 		e.t.Fatal(err)
 	}

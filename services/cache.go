@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -57,7 +58,24 @@ func RegisterCacheFlags(f []cli.Flag) []cli.Flag {
 type DiskCache struct {
 	location string
 	subdir   string
+
+	mu    sync.Mutex
+	since map[string]time.Time // shard root → versionMarker time
 }
+
+// objVersion identifies the bytes of an object. Keys are not immutable: vault
+// re-uploads a corrupt file under the same key, so a chunk is named by the
+// object's ETag as well, and a re-uploaded object never hits its old bytes.
+type objVersion struct {
+	etag     string
+	modified time.Time
+}
+
+// versionMarker, in each shard root, records when that shard started naming
+// chunks by version. Chunks from before carry none: they are trusted only for
+// objects last modified before then (unchanged since they were cached), which
+// keeps the existing cache warm. The evictor never removes it.
+const versionMarker = ".versioned-since"
 
 // NewDiskCache returns nil when caching is disabled; callers must treat
 // (*DiskCache)(nil) as a no-op (Get/Put short-circuit on nil receiver).
@@ -90,20 +108,71 @@ func (c *DiskCache) CacheRoots() ([]string, error) {
 	return out, nil
 }
 
-func (c *DiskCache) path(key string, alignedOffset int64) (string, error) {
+// root is the shard root (shard dir + subdir) that holds key's chunks.
+func (c *DiskCache) root(key string) (string, string, error) {
 	sum := sha1.Sum([]byte(key))
 	h := hex.EncodeToString(sum[:])
 	shard, err := getDir(c.location, h)
 	if err != nil {
+		return "", "", err
+	}
+	return filepath.Join(shard, c.subdir), h, nil
+}
+
+// path is a chunk's file. Filename = sha1(key + ":" + offset [+ ":" + etag]).
+// Uniform 40-char hex, no prefix/suffix — matches TWS's naming style. An
+// empty etag gives the pre-versioning name.
+func (c *DiskCache) path(key string, v objVersion, alignedOffset int64) (string, error) {
+	root, h, err := c.root(key)
+	if err != nil {
 		return "", err
 	}
-	// Chunk filename = sha1(key + ":" + offset). Uniform 40-char hex,
-	// no prefix/suffix — matches TWS's naming style. Offset is no
-	// longer human-readable from the filename; that's fine since the
-	// only callers are this process and the evictor (by mtime).
-	chunkSum := sha1.Sum([]byte(key + ":" + strconv.FormatInt(alignedOffset, 10)))
-	chunk := hex.EncodeToString(chunkSum[:])
-	return filepath.Join(shard, c.subdir, h[:2], h, chunk), nil
+	name := key + ":" + strconv.FormatInt(alignedOffset, 10)
+	if v.etag != "" {
+		name += ":" + v.etag
+	}
+	chunkSum := sha1.Sum([]byte(name))
+	return filepath.Join(root, h[:2], h, hex.EncodeToString(chunkSum[:])), nil
+}
+
+// versionedSince returns (creating it on first use) the versionMarker time of
+// key's shard root.
+func (c *DiskCache) versionedSince(key string) (time.Time, error) {
+	root, _, err := c.root(key)
+	if err != nil {
+		return time.Time{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if t, ok := c.since[root]; ok {
+		return t, nil
+	}
+	marker := filepath.Join(root, versionMarker)
+	b, err := os.ReadFile(marker)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(root, 0755); err != nil {
+			return time.Time{}, err
+		}
+		b = []byte(time.Now().UTC().Format(time.RFC3339Nano))
+		tmp := marker + ".new"
+		if err := os.WriteFile(tmp, b, 0644); err != nil {
+			return time.Time{}, err
+		}
+		if err := os.Rename(tmp, marker); err != nil {
+			return time.Time{}, err
+		}
+	} else if err != nil {
+		return time.Time{}, err
+	}
+	t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b)))
+	if err != nil {
+		return time.Time{}, err
+	}
+	if c.since == nil {
+		c.since = map[string]time.Time{}
+	}
+	c.since[root] = t
+	return t, nil
 }
 
 // Get returns an open *os.File handle + size on hit, (nil, 0, nil) on
@@ -112,15 +181,28 @@ func (c *DiskCache) path(key string, alignedOffset int64) (string, error) {
 // hit-path can stream via io.CopyN instead of materialising a 4 MiB
 // buffer per chunk in RAM — under load that allocation was the
 // dominant heap pressure in pprof.
-func (c *DiskCache) Get(key string, alignedOffset int64) (*os.File, int64, error) {
+func (c *DiskCache) Get(key string, v objVersion, alignedOffset int64) (*os.File, int64, error) {
 	if c == nil {
 		return nil, 0, nil
 	}
-	p, err := c.path(key, alignedOffset)
+	p, err := c.path(key, v, alignedOffset)
 	if err != nil {
 		return nil, 0, err
 	}
 	f, err := os.Open(p)
+	if os.IsNotExist(err) && v.etag != "" {
+		// A chunk cached before versioning: valid only if the object has
+		// not changed since this shard started versioning. A shard that
+		// cannot get its marker cannot write chunks either (read-only),
+		// so all it holds predates versioning: trusted, as before.
+		since, sErr := c.versionedSince(key)
+		if sErr != nil || v.modified.IsZero() || v.modified.Before(since) {
+			if p, err = c.path(key, objVersion{}, alignedOffset); err != nil {
+				return nil, 0, err
+			}
+			f, err = os.Open(p)
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, 0, nil
@@ -147,11 +229,17 @@ func (c *DiskCache) Get(key string, alignedOffset int64) (*os.File, int64, error
 // Returns (nil, "", nil) on a nil (disabled) cache. Idempotent —
 // concurrent Puts for the same key race on the rename and the loser
 // silently overwrites (same bytes: chunks are immutable).
-func (c *DiskCache) Put(key string, alignedOffset int64, data []byte) (*os.File, string, error) {
+func (c *DiskCache) Put(key string, v objVersion, alignedOffset int64, data []byte) (*os.File, string, error) {
 	if c == nil {
 		return nil, "", nil
 	}
-	p, err := c.path(key, alignedOffset)
+	if v.etag != "" {
+		// The marker must predate every versioned chunk of this shard.
+		if _, err := c.versionedSince(key); err != nil {
+			return nil, "", err
+		}
+	}
+	p, err := c.path(key, v, alignedOffset)
 	if err != nil {
 		return nil, "", err
 	}

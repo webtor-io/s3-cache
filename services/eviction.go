@@ -125,6 +125,9 @@ func (e *Evictor) sweepShard(shard string) {
 			return nil
 		}
 		name := d.Name()
+		if name == versionMarker {
+			return nil // never evicted: see versionMarker
+		}
 		// Stale tmp file from a crashed Put: nuke unconditionally.
 		if len(name) > 5 && name[:5] == ".tmp_" {
 			if now.Sub(info.ModTime()) > tmpMaxAge {
