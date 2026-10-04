@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -59,8 +60,8 @@ type DiskCache struct {
 	location string
 	subdir   string
 
-	mu    sync.Mutex
-	since map[string]time.Time // shard root → versionMarker time
+	mu    sync.RWMutex
+	since map[string]time.Time // shard root → versionMarker time; zero = unknown
 }
 
 // objVersion identifies the bytes of an object. Keys are not immutable: vault
@@ -83,10 +84,12 @@ func NewDiskCache(c *cli.Context) *DiskCache {
 	if !c.Bool(CacheEnabledFlag) {
 		return nil
 	}
-	return &DiskCache{
+	dc := &DiskCache{
 		location: c.String(CacheDirFlag),
 		subdir:   c.String(CacheShardSubdirFlag),
 	}
+	dc.ensureMarkers()
+	return dc
 }
 
 // CacheRoots returns the per-shard directories we own (i.e. shardDir +
@@ -135,18 +138,42 @@ func (c *DiskCache) path(key string, v objVersion, alignedOffset int64) (string,
 	return filepath.Join(root, h[:2], h, hex.EncodeToString(chunkSum[:])), nil
 }
 
-// versionedSince returns (creating it on first use) the versionMarker time of
-// key's shard root.
+// versionedSince returns the versionMarker time of key's shard root,
+// creating the marker if missing. The zero time means unknown (unreadable
+// marker, read-only shard): callers then trust old chunks, as before
+// versioning. The result, unknown included, is remembered.
 func (c *DiskCache) versionedSince(key string) (time.Time, error) {
 	root, _, err := c.root(key)
 	if err != nil {
 		return time.Time{}, err
 	}
+	return c.markerTime(root), nil
+}
+
+func (c *DiskCache) markerTime(root string) time.Time {
+	c.mu.RLock()
+	t, ok := c.since[root]
+	c.mu.RUnlock()
+	if ok {
+		return t
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if t, ok := c.since[root]; ok {
-		return t, nil
+		return t
 	}
+	t, err := readOrCreateMarker(root)
+	if err != nil {
+		log.WithError(err).WithField("root", root).Warn("cache version marker unavailable; trusting unversioned chunks")
+	}
+	if c.since == nil {
+		c.since = map[string]time.Time{}
+	}
+	c.since[root] = t
+	return t
+}
+
+func readOrCreateMarker(root string) (time.Time, error) {
 	marker := filepath.Join(root, versionMarker)
 	b, err := os.ReadFile(marker)
 	if os.IsNotExist(err) {
@@ -154,25 +181,44 @@ func (c *DiskCache) versionedSince(key string) (time.Time, error) {
 			return time.Time{}, err
 		}
 		b = []byte(time.Now().UTC().Format(time.RFC3339Nano))
-		tmp := marker + ".new"
-		if err := os.WriteFile(tmp, b, 0644); err != nil {
+		tmp, err := os.CreateTemp(root, ".tmp_marker_*") // the evictor reaps a crash's leftover
+		if err != nil {
 			return time.Time{}, err
 		}
-		if err := os.Rename(tmp, marker); err != nil {
-			return time.Time{}, err
+		_, werr := tmp.Write(b)
+		if serr := tmp.Sync(); werr == nil {
+			werr = serr
+		}
+		if cerr := tmp.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr == nil {
+			werr = os.Rename(tmp.Name(), marker)
+		}
+		if werr != nil {
+			os.Remove(tmp.Name())
+			return time.Time{}, werr
 		}
 	} else if err != nil {
 		return time.Time{}, err
 	}
-	t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b)))
+	return time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b)))
+}
+
+// ensureMarkers creates every shard's marker at startup, so an object
+// re-uploaded between a deploy and a shard's first use is newer than it.
+func (c *DiskCache) ensureMarkers() {
+	if c == nil {
+		return
+	}
+	roots, err := c.CacheRoots()
 	if err != nil {
-		return time.Time{}, err
+		log.WithError(err).Warn("cache version markers: listing shards failed")
+		return
 	}
-	if c.since == nil {
-		c.since = map[string]time.Time{}
+	for _, r := range roots {
+		c.markerTime(r)
 	}
-	c.since[root] = t
-	return t, nil
 }
 
 // Get returns an open *os.File handle + size on hit, (nil, 0, nil) on
@@ -196,7 +242,7 @@ func (c *DiskCache) Get(key string, v objVersion, alignedOffset int64) (*os.File
 		// cannot get its marker cannot write chunks either (read-only),
 		// so all it holds predates versioning: trusted, as before.
 		since, sErr := c.versionedSince(key)
-		if sErr != nil || v.modified.IsZero() || v.modified.Before(since) {
+		if sErr != nil || since.IsZero() || v.modified.IsZero() || v.modified.Before(since) {
 			if p, err = c.path(key, objVersion{}, alignedOffset); err != nil {
 				return nil, 0, err
 			}
@@ -234,10 +280,9 @@ func (c *DiskCache) Put(key string, v objVersion, alignedOffset int64, data []by
 		return nil, "", nil
 	}
 	if v.etag != "" {
-		// The marker must predate every versioned chunk of this shard.
-		if _, err := c.versionedSince(key); err != nil {
-			return nil, "", err
-		}
+		// The marker should predate this shard's versioned chunks; if it is
+		// unavailable the chunk is still correct under its own version.
+		_, _ = c.versionedSince(key)
 	}
 	p, err := c.path(key, v, alignedOffset)
 	if err != nil {

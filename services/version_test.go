@@ -121,6 +121,10 @@ func (s *fakeObjectStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Last-Modified", mod.UTC().Format(http.TimeFormat))
+	if m := r.Header.Get("If-Match"); m != "" && m != etag {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
 	start, end := int64(0), int64(len(data))-1
 	if rg := r.Header.Get("Range"); rg != "" {
 		fmt.Sscanf(rg, "bytes=%d-%d", &start, &end)
@@ -143,7 +147,7 @@ func (s *fakeObjectStore) put(data []byte, etag string, modified time.Time) {
 	s.data, s.etag, s.modified = data, etag, modified
 }
 
-func testFetcher(t *testing.T, endpoint string, cache *DiskCache) *Fetcher {
+func testFetcher(t *testing.T, endpoint string, cache *DiskCache, headTTL ...time.Duration) *Fetcher {
 	t.Helper()
 	app := cli.NewApp()
 	app.Flags = cs.RegisterS3ClientFlags(nil)
@@ -160,7 +164,7 @@ func testFetcher(t *testing.T, endpoint string, cache *DiskCache) *Fetcher {
 		s3cl: cs.NewS3Client(cli.NewContext(app, set, nil), http.DefaultClient), bucket: "b",
 		chunkSize: chunk, workers: 2, cache: cache, sf: newSingleflight(),
 		budget: newChunkBudget(4, chunk), chunkFetchTimeout: 5 * time.Second,
-		writeGuardTimeout: 2500 * time.Millisecond, heads: newHeadCache(0),
+		writeGuardTimeout: 2500 * time.Millisecond, heads: newHeadCache(append(headTTL, 0)[0]),
 	}
 }
 
@@ -187,5 +191,66 @@ func TestFetcher_ServesReUploadedObject(t *testing.T) {
 	store.put([]byte(strings.Repeat("new-", 700)), `"v2"`, time.Now().Add(time.Minute))
 	if got := get(t, f); !strings.HasPrefix(got, "new-") || strings.Contains(got, "old-") {
 		t.Fatalf("after re-upload: served %.8q…, want only the new bytes", got)
+	}
+}
+
+// Within the HEAD TTL after a re-upload the cached ETag is old. A chunk missed
+// then must not be fetched from the new object and filed under the old
+// version: one response would mix old and new bytes. Chunk GETs are
+// conditional on the version; a mismatch drops the stale HEAD instead.
+func TestFetcher_NoMixedVersionsWithinHeadTTL(t *testing.T) {
+	store := &fakeObjectStore{}
+	store.put([]byte(strings.Repeat("old-", 700)), `"v1"`, time.Now().Add(-time.Minute))
+	srv := httptest.NewServer(store)
+	defer srv.Close()
+	f := testFetcher(t, srv.URL, testDiskCache(t), time.Hour)
+	rec := httptest.NewRecorder()
+	if err := f.Get(context.Background(), rec, "obj", 0, 1023, 0, true); err != nil { // caches chunk 0 only
+		t.Fatal(err)
+	}
+	store.put([]byte(strings.Repeat("new-", 700)), `"v2"`, time.Now().Add(time.Minute))
+	rec = httptest.NewRecorder()
+	_ = f.Get(context.Background(), rec, "obj", 0, -1, 0, false)
+	if body := rec.Body.String(); strings.Contains(body, "old-") && strings.Contains(body, "new-") {
+		t.Fatal("one response mixed the old and the new object")
+	}
+	if got := get(t, f); strings.Contains(got, "old-") {
+		t.Fatalf("after the version mismatch: served %.8q…, want the new bytes", got)
+	}
+}
+
+// A marker that cannot be read does not stop caching: versioned chunks need no
+// marker, and old ones are then trusted, as before versioning.
+func TestDiskCache_BadMarkerKeepsCaching(t *testing.T) {
+	c := testDiskCache(t)
+	roots, _ := c.CacheRoots()
+	if err := os.MkdirAll(roots[0], 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(roots[0], versionMarker), nil, 0644); err != nil { // torn write
+		t.Fatal(err)
+	}
+	pin, _, err := c.Put("k", objVersion{etag: "e"}, 0, []byte("new"))
+	if err != nil {
+		t.Fatalf("put with a bad marker: %v", err)
+	}
+	pin.Close()
+	if f, _, _ := c.Get("k", objVersion{etag: "e"}, 0); f == nil {
+		t.Fatal("versioned chunk not served")
+	} else {
+		f.Close()
+	}
+}
+
+// Markers exist from startup: an object re-uploaded between the deploy and
+// the first use of a shard must not have its old chunks trusted.
+func TestDiskCache_MarkersCreatedAtStart(t *testing.T) {
+	c := testDiskCache(t)
+	c.ensureMarkers()
+	roots, _ := c.CacheRoots()
+	for _, r := range roots {
+		if _, err := os.Stat(filepath.Join(r, versionMarker)); err != nil {
+			t.Fatalf("%s: %v", r, err)
+		}
 	}
 }

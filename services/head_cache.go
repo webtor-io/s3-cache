@@ -43,6 +43,13 @@ func (h *headCache) get(key string) (*s3.HeadObjectOutput, bool) {
 	return e.out, time.Since(e.at) < h.ttl
 }
 
+// drop forgets key's entry, stale fallback included.
+func (h *headCache) drop(key string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.m, key)
+}
+
 func (h *headCache) put(key string, out *s3.HeadObjectOutput) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

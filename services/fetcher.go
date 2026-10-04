@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/pkg/errors"
@@ -541,7 +542,7 @@ func (f *Fetcher) lead(sfKey, key string, v objVersion, start, end int64, source
 	c.admit()
 
 	buf := f.budget.alloc(size)
-	if err := f.download(dctx, key, start, end, source, buf); err != nil {
+	if err := f.download(dctx, key, v, start, end, source, buf); err != nil {
 		f.budget.release(size)
 		res.err = err
 		f.sf.finish(sfKey, c, res)
@@ -586,10 +587,17 @@ func dropValidatorHeaders(w http.ResponseWriter) {
 }
 
 // download fills buf with bytes [start..end] of key from S3.
-func (f *Fetcher) download(ctx context.Context, key string, start, end int64, source string, buf []byte) error {
+func (f *Fetcher) download(ctx context.Context, key string, v objVersion, start, end int64, source string, buf []byte) error {
 	t0 := time.Now()
-	body, _, _, err := f.openRange(ctx, key, start, end)
+	body, _, _, err := f.openRange(ctx, key, v.etag, start, end)
 	if err != nil {
+		var rf awserr.RequestFailure
+		if errors.As(err, &rf) && rf.StatusCode() == http.StatusPreconditionFailed {
+			// The object changed since the cached HEAD: these bytes must not
+			// be filed under the old version, or one response would mix two
+			// objects. Drop the HEAD so the next request sees the new one.
+			f.heads.drop(key)
+		}
 		return err
 	}
 	defer body.Close()
@@ -611,13 +619,16 @@ func (f *Fetcher) download(ctx context.Context, key string, start, end int64, so
 	return nil
 }
 
-// openRange opens a single Range GET against S3. Returns body +
-// Content-Range + Content-Type.
-func (f *Fetcher) openRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, string, string, error) {
+// openRange opens a single Range GET against S3, conditional on the object
+// still having etag (when known). Returns body + Content-Range + Content-Type.
+func (f *Fetcher) openRange(ctx context.Context, key, etag string, start, end int64) (io.ReadCloser, string, string, error) {
 	in := &s3.GetObjectInput{
 		Bucket: aws.String(f.bucket),
 		Key:    aws.String(key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+	}
+	if etag != "" {
+		in.IfMatch = aws.String(etag)
 	}
 	out, err := f.s3cl.Get().GetObjectWithContext(ctx, in, func(r *request.Request) {
 		r.HTTPRequest.Header.Set("User-Agent", "webtor-s3-cache/0.2")
