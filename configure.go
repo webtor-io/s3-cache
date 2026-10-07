@@ -86,6 +86,8 @@ func run(c *cli.Context) error {
 	}
 
 	web := s.NewWeb(c, fetcher)
+	// The last defer, so it runs first: in-flight responses drain while the
+	// evictor, the S3 client and the probes are still up.
 	defer web.Close()
 	servers = append(servers, web)
 

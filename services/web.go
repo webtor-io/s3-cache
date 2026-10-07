@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	cs "github.com/webtor-io/common-services"
 )
 
 const (
@@ -22,11 +23,12 @@ const (
 type Web struct {
 	host    string
 	port    int
-	ln      net.Listener
 	fetcher *Fetcher
+	gs      *cs.GracefulServer
 }
 
 func RegisterWebFlags(f []cli.Flag) []cli.Flag {
+	f = cs.RegisterShutdownFlags(f)
 	return append(f,
 		cli.StringFlag{
 			Name:   WebHostFlag,
@@ -48,6 +50,7 @@ func NewWeb(c *cli.Context, fetcher *Fetcher) *Web {
 		host:    c.String(WebHostFlag),
 		port:    c.Int(WebPortFlag),
 		fetcher: fetcher,
+		gs:      cs.NewGracefulServer(cs.ShutdownTimeout(c)),
 	}
 }
 
@@ -181,16 +184,21 @@ func (s *Web) Serve() error {
 	if err != nil {
 		return errors.Wrap(err, "failed to listen")
 	}
-	s.ln = ln
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handle)
 	log.Infof("serving s3-cache at %v", addr)
-	srv := &http.Server{Handler: mux}
-	return srv.Serve(ln)
+	return s.serve(ln)
 }
 
+func (s *Web) serve(ln net.Listener) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handle)
+	return s.gs.Serve(&http.Server{Handler: mux}, ln)
+}
+
+// Close stops accepting and lets in-flight responses finish, up to
+// WEB_SHUTDOWN_TIMEOUT; streams still open then are cut (thp resumes them
+// with Range on the pod that replaces this one). Closing only the listener
+// let the process exit in the middle of every response. run() defers it
+// last, so it runs before anything the handlers use is closed.
 func (s *Web) Close() {
-	if s.ln != nil {
-		_ = s.ln.Close()
-	}
+	s.gs.Close()
 }

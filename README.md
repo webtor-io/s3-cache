@@ -137,6 +137,7 @@ All settings via env vars (or matching CLI flags).
 | Env | Default | Purpose |
 |---|---|---|
 | `WEB_PORT` | 8080 | HTTP listen port |
+| `WEB_SHUTDOWN_TIMEOUT` | `20s` | On SIGTERM, how long in-flight responses may finish before the rest are cut; keep below `terminationGracePeriodSeconds` minus the preStop sleep |
 | `PROBE_PORT` | 8081 | Liveness/readiness port |
 | `PPROF_PORT` | 8082 | pprof `/debug/pprof`-equivalent endpoints (`USE_PPROF=true` default) |
 | `PROM_PORT` | 8083 | Prometheus `/metrics` port |

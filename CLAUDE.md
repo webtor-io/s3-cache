@@ -274,6 +274,9 @@ Common-services wiring:
 - `cs.RegisterPprofFlags` — pprof endpoints on `PPROF_PORT` (default 8082, `USE_PPROF=true` default)
 - `cs.RegisterPromFlags` — `/metrics` on `PROM_PORT` (default 8083, `USE_PROM=true` default)
 - `cs.RegisterS3ClientFlags` — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT`, `AWS_REGION`, `AWS_NO_SSL`
+- `cs.RegisterShutdownFlags` (via `RegisterWebFlags`) — `WEB_SHUTDOWN_TIMEOUT` (20s): `Web.Close` is a `cs.GracefulServer` drain; it is `run()`'s last defer, so it runs before anything the handlers use is closed
+
+Two processes may share one set of shard dirs (a DaemonSet surge starts the new pod next to the old one): chunks are written tmp+rename and are immutable per (key, offset, ETag), a reader keeps its open handle when the other process evicts the path, and each evictor caps the bytes on disk, not its own writes. Two sweeps that overlap can evict up to twice the excess (a file the other one removed is skipped, not counted).
 
 Local tunables:
 
