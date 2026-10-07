@@ -8,7 +8,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/sirupsen/logrus v1.9.3
 	github.com/urfave/cli v1.22.17
-	github.com/webtor-io/common-services v0.0.0-20260927094256-ddfbf24ea805
+	github.com/webtor-io/common-services v0.0.0-20261007162356-7960c21dad8f
 )
 
 require (
